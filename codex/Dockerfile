@@ -105,26 +105,34 @@ RUN chmod +x /usr/local/bin/github-app-credential-helper \
     /usr/local/bin/kelos-agent-setup \
     /usr/local/bin/gh
 
-# Alpheya engineering skills — baked at image build time so kelos-agent-setup
-# can append selected SKILL.md files to ~/.codex/AGENTS.md without a per-task
-# clone. Source repo (quantum-wealth/skills) is private, so the build needs a
-# GitHub token via BuildKit secret: `docker buildx build --secret
-# id=github_token,env=GITHUB_TOKEN ...`. When the secret is absent the build
-# still succeeds (with an empty /opt/alpheya-skills) so a developer without
-# the token can iterate locally; only Cody tasks that set ALPHEYA_SKILL_HOOKS
-# require the directory populated.
+# Alpheya engineering skills — baked at image build time into the
+# system-wide codex skills directory. Per https://developers.openai.com/codex/skills,
+# Codex auto-discovers skills from /etc/codex/skills/<name>/SKILL.md at
+# startup (no flag, no env var, no entrypoint logic required). The
+# skill's `description` frontmatter tells codex when to trigger it.
+#
+# Source repo (quantum-wealth/skills) is private, so the build needs a
+# GitHub token via BuildKit secret:
+#   docker buildx build --secret id=github_token,env=GITHUB_TOKEN ...
+# When the secret is absent the build still succeeds (with an empty
+# /etc/codex/skills) so a developer without the token can iterate
+# locally; codex just has no Alpheya skills to discover.
 ARG ALPHEYA_SKILLS_REPO=quantum-wealth/skills
 ARG ALPHEYA_SKILLS_REF=main
 RUN --mount=type=secret,id=github_token \
-    if [ -s /run/secrets/github_token ]; then \
+    mkdir -p /etc/codex/skills \
+    && if [ -s /run/secrets/github_token ]; then \
       TOKEN=$(cat /run/secrets/github_token) \
       && git clone --depth 1 --branch "${ALPHEYA_SKILLS_REF}" \
            "https://x-access-token:${TOKEN}@github.com/${ALPHEYA_SKILLS_REPO}.git" \
-           /opt/alpheya-skills \
-      && rm -rf /opt/alpheya-skills/.git ; \
+           /tmp/alpheya-skills-clone \
+      && for skill_dir in /tmp/alpheya-skills-clone/plugins/alpheya-standards/skills/*/; do \
+           [ -d "$skill_dir" ] || continue ; \
+           cp -r "$skill_dir" /etc/codex/skills/ ; \
+         done \
+      && rm -rf /tmp/alpheya-skills-clone ; \
     else \
-      echo "WARNING: github_token build secret not provided; /opt/alpheya-skills will be empty" >&2 \
-      && mkdir -p /opt/alpheya-skills ; \
+      echo "WARNING: github_token build secret not provided; /etc/codex/skills will be empty" >&2 ; \
     fi
 
 ARG TARGETARCH
