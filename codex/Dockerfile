@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y \
     git \
     jq \
     openssl \
+    postgresql-client \
+    redis-tools \
+    dnsutils \
+    netcat-openbsd \
+    iputils-ping \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -18,6 +23,28 @@ RUN apt-get update && apt-get install -y \
     && apt-get update \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
+
+# yq — YAML processor for k8s manifest introspection.
+ARG YQ_VERSION=v4.45.1
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \
+    && chmod +x /usr/local/bin/yq
+
+# kustomize — render gitops overlays locally during debug runs.
+ARG KUSTOMIZE_VERSION=v5.5.0
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL -o /tmp/kustomize.tgz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz" \
+    && tar -xzf /tmp/kustomize.tgz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/kustomize \
+    && rm /tmp/kustomize.tgz
+
+# Flux CLI — inspect HelmRelease / Kustomization / GitRepository state.
+ARG FLUX_VERSION=2.4.0
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL -o /tmp/flux.tgz "https://github.com/fluxcd/flux2/releases/download/v${FLUX_VERSION}/flux_${FLUX_VERSION}_linux_${ARCH}.tar.gz" \
+    && tar -xzf /tmp/flux.tgz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/flux \
+    && rm /tmp/flux.tgz
 
 # kubectl — pinned to a stable minor matching what the cluster runs.
 # Tasks that need cluster introspection use this against the in-cluster
@@ -54,9 +81,13 @@ RUN chmod +x /kelos_entrypoint.sh
 COPY codex/scripts/github-app-credential-helper /usr/local/bin/github-app-credential-helper
 COPY codex/scripts/github-app-token /usr/local/bin/github-app-token
 COPY codex/scripts/kelos-agent-setup /usr/local/bin/kelos-agent-setup
+# gh wrapper sits at /usr/local/bin/gh (ahead of /usr/bin/gh in PATH) so
+# every gh invocation picks up an App installation token automatically.
+COPY codex/scripts/gh /usr/local/bin/gh
 RUN chmod +x /usr/local/bin/github-app-credential-helper \
     /usr/local/bin/github-app-token \
-    /usr/local/bin/kelos-agent-setup
+    /usr/local/bin/kelos-agent-setup \
+    /usr/local/bin/gh
 
 ARG TARGETARCH
 COPY bin/kelos-capture-linux-${TARGETARCH} /kelos/kelos-capture
