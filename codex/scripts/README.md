@@ -24,6 +24,7 @@ setup is skipped entirely and the container runs as before.
 - **`kelos-agent-setup`** — Pre-agent setup invoked from `kelos_entrypoint.sh`. Materialises the GitHub App private key to disk, wires `git config credential.helper`, and synthesises `~/.kube/config` from the projected ServiceAccount token. Each step is a no-op when its inputs are missing, so this script is safe to run unconditionally.
 - **`github-app-credential-helper`** — Git credential helper. Reads the credential request on stdin and, for `github.com` / `api.github.com` over HTTPS, returns a fresh installation token as the password. Returns nothing for other hosts so git falls through to its other helpers.
 - **`github-app-token`** — Signs a short-lived JWT with the App private key and exchanges it at `/app/installations/{id}/access_tokens` for a ~1 h installation token. Three attempts with exponential backoff before failing, so a transient network hiccup doesn't hang `git push`.
+- **`gh`** — Wrapper at `/usr/local/bin/gh` (ahead of `/usr/bin/gh` in `PATH`) that mints an installation token and exports it as `GH_TOKEN` before exec'ing the real `gh`. Lets every `gh` invocation use App auth without per-call plumbing. Defers to a pre-set `GH_TOKEN` / `GITHUB_TOKEN` when one is already in the env.
 
 ## Why credential.helper instead of a static `GITHUB_TOKEN`
 

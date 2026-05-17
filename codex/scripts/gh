@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# gh wrapper: mints a fresh GitHub App installation token and exports it
+# as GH_TOKEN before exec'ing the real gh binary.
+#
+# Sits at /usr/local/bin/gh, which is ahead of /usr/bin/gh in PATH, so any
+# `gh` invocation (from the agent, from shells, from hooks) gets App auth
+# without any per-call plumbing.
+#
+# If GH_TOKEN or GITHUB_TOKEN is already set in the env (e.g. an operator
+# has injected one for a one-off override), the wrapper does nothing —
+# the existing token wins and the real gh sees it unchanged.
+set -euo pipefail
+
+if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_APP_CLIENT_ID:-}" ]]; then
+    GH_TOKEN=$(/usr/local/bin/github-app-token)
+    export GH_TOKEN
+  fi
+fi
+
+exec /usr/bin/gh "$@"
