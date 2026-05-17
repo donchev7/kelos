@@ -37,6 +37,16 @@ setup_github_app_credentials() {
   git config --global credential.useHttpPath true
 }
 
+setup_git_identity() {
+  # Without this, `git commit` aborts with "Please tell me who you are".
+  # The values are overridable via env so non-Cody agents can re-label.
+  local name email
+  name="${GIT_AUTHOR_NAME:-Cody (Alpheya)}"
+  email="${GIT_AUTHOR_EMAIL:-cody@alpheya.com}"
+  git config --global user.name "$name"
+  git config --global user.email "$email"
+}
+
 setup_kubeconfig() {
   local sa_dir="/var/run/secrets/kubernetes.io/serviceaccount"
   if [[ ! -r "${sa_dir}/token" ]]; then
@@ -74,4 +84,5 @@ EOF
 }
 
 setup_github_app_credentials
+setup_git_identity
 setup_kubeconfig

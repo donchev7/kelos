@@ -13,6 +13,9 @@ itself once it is running.
 | `GITHUB_APP_INSTALLATION_ID` | Task `podOverrides.envFrom` (Secret) | `github-app-token` | Installation to mint the token for. |
 | `GITHUB_APP_PRIVATE_KEY` | Task `podOverrides.envFrom` (Secret) | `kelos-agent-setup` | Written to `$HOME/.kelos-agent/github-app.pem` once at startup; the helper reads from the file, not the env var, on each call. `$HOME` (not `/etc/`) because the container runs as the non-root `agent` user. |
 | `KUBERNETES_CLUSTER_NAME` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Optional human-readable cluster name baked into `~/.kube/config`. Defaults to `in-cluster`. |
+| `GIT_AUTHOR_NAME` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Sets `git config user.name`. Without it `git commit` aborts. Defaults to `Cody (Alpheya)`. |
+| `GIT_AUTHOR_EMAIL` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Sets `git config user.email`. Defaults to `cody@alpheya.com`. |
+| `ALPHEYA_SKILL_HOOKS` | Task `podOverrides.env` (literal, e.g. `code-simplifier,create-pr`) | `kelos_entrypoint.sh` | Comma-separated list of skill names under `/opt/alpheya-skills/plugins/alpheya-standards/skills/`. Each named `SKILL.md` is appended to `~/.codex/AGENTS.md` so codex picks them up as always-on hooks. Codex 0.130.0 has no working `--enable skills` flag, so AGENTS.md is the only reliable injection point. |
 
 All three GitHub App variables are mutually required — `kelos-agent-setup`
 aborts the task if `CLIENT_ID` is set but `PRIVATE_KEY` is missing rather

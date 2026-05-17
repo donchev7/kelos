@@ -98,8 +98,13 @@ image: ## Build docker images (use WHAT, IMAGE_PLATFORMS, PUSH=true to customize
 		mv bin/kelos-capture bin/kelos-capture-linux-$$arch; \
 	done
 	@for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
+		secret_flag=""; \
+		if [ -n "$$GITHUB_TOKEN" ]; then \
+			secret_flag="--secret id=github_token,env=GITHUB_TOKEN"; \
+		fi; \
 		docker buildx build --platform $(IMAGE_PLATFORMS) \
 			$(if $(filter true,$(PUSH)),--push,--load) \
+			$$secret_flag \
 			-t $(REGISTRY)/$$(basename $$dir):$(VERSION) \
 			-f $$dir/Dockerfile .; \
 	done
