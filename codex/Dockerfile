@@ -57,6 +57,22 @@ RUN ARCH=$(dpkg --print-architecture) \
     && chmod +x /usr/local/bin/kubectl \
     && rm /tmp/kubectl.sha256
 
+# mise — required by platform-services' Makefile / pre-PR checks
+# (mise run fmt:all / lint:all / build:all / test:all). Platform-services
+# pins min_version=2025.2.6 in mise.toml; pin a recent stable release.
+ARG MISE_VERSION=2025.5.0
+RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') \
+    && curl -fsSL -o /tmp/mise.tgz "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${ARCH}.tar.gz" \
+    && tar -xzf /tmp/mise.tgz -C /tmp \
+    && mv /tmp/mise/bin/mise /usr/local/bin/mise \
+    && chmod +x /usr/local/bin/mise \
+    && rm -rf /tmp/mise /tmp/mise.tgz
+
+# pnpm — required by frontend pre-PR checks. Pinned to the version the
+# frontend monorepo declares in packageManager (pnpm@10.27.0).
+ARG PNPM_VERSION=10.27.0
+RUN npm install -g pnpm@${PNPM_VERSION}
+
 RUN ARCH=$(dpkg --print-architecture) \
     && TARBALL="go${GO_VERSION}.linux-${ARCH}.tar.gz" \
     && curl -fsSL -o "/tmp/${TARBALL}" "https://dl.google.com/go/${TARBALL}" \
@@ -88,6 +104,28 @@ RUN chmod +x /usr/local/bin/github-app-credential-helper \
     /usr/local/bin/github-app-token \
     /usr/local/bin/kelos-agent-setup \
     /usr/local/bin/gh
+
+# Alpheya engineering skills — baked at image build time so kelos-agent-setup
+# can append selected SKILL.md files to ~/.codex/AGENTS.md without a per-task
+# clone. Source repo (quantum-wealth/skills) is private, so the build needs a
+# GitHub token via BuildKit secret: `docker buildx build --secret
+# id=github_token,env=GITHUB_TOKEN ...`. When the secret is absent the build
+# still succeeds (with an empty /opt/alpheya-skills) so a developer without
+# the token can iterate locally; only Cody tasks that set ALPHEYA_SKILL_HOOKS
+# require the directory populated.
+ARG ALPHEYA_SKILLS_REPO=quantum-wealth/skills
+ARG ALPHEYA_SKILLS_REF=main
+RUN --mount=type=secret,id=github_token \
+    if [ -s /run/secrets/github_token ]; then \
+      TOKEN=$(cat /run/secrets/github_token) \
+      && git clone --depth 1 --branch "${ALPHEYA_SKILLS_REF}" \
+           "https://x-access-token:${TOKEN}@github.com/${ALPHEYA_SKILLS_REPO}.git" \
+           /opt/alpheya-skills \
+      && rm -rf /opt/alpheya-skills/.git ; \
+    else \
+      echo "WARNING: github_token build secret not provided; /opt/alpheya-skills will be empty" >&2 \
+      && mkdir -p /opt/alpheya-skills ; \
+    fi
 
 ARG TARGETARCH
 COPY bin/kelos-capture-linux-${TARGETARCH} /kelos/kelos-capture

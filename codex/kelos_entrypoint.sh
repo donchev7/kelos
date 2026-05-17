@@ -44,6 +44,37 @@ if [ -n "${KELOS_AGENTS_MD:-}" ]; then
   printf '%s' "$KELOS_AGENTS_MD" >~/.codex/AGENTS.md
 fi
 
+# Append always-on Alpheya skill hooks from the baked-in repo. Codex
+# 0.130.0 has no working --enable skills flag, so the only entrypoint
+# the agent reliably reads is ~/.codex/AGENTS.md. Each comma-separated
+# name in ALPHEYA_SKILL_HOOKS resolves to a SKILL.md under
+# /opt/alpheya-skills/plugins/alpheya-standards/skills/<name>/ and gets
+# appended with a `---` separator. No-op when the env is unset.
+if [ -n "${ALPHEYA_SKILL_HOOKS:-}" ]; then
+  alpheya_skills_root="/opt/alpheya-skills/plugins/alpheya-standards/skills"
+  if [ -d "$alpheya_skills_root" ]; then
+    mkdir -p ~/.codex
+    touch ~/.codex/AGENTS.md
+    IFS=',' read -ra alpheya_hooks <<<"$ALPHEYA_SKILL_HOOKS"
+    for alpheya_hook in "${alpheya_hooks[@]}"; do
+      alpheya_hook="${alpheya_hook// /}"
+      [ -z "$alpheya_hook" ] && continue
+      alpheya_skill_file="${alpheya_skills_root}/${alpheya_hook}/SKILL.md"
+      if [ ! -f "$alpheya_skill_file" ]; then
+        echo "kelos_entrypoint: skill '$alpheya_hook' not found at $alpheya_skill_file — skipping" >&2
+        continue
+      fi
+      {
+        printf '\n---\n\n'
+        cat "$alpheya_skill_file"
+      } >>~/.codex/AGENTS.md
+    done
+    unset alpheya_skills_root alpheya_hooks alpheya_hook alpheya_skill_file
+  else
+    echo "kelos_entrypoint: ALPHEYA_SKILL_HOOKS set but $alpheya_skills_root absent in image" >&2
+  fi
+fi
+
 # Install each plugin as a Codex skill directory under ~/.codex/skills.
 # Codex CLI 0.130.0 does not accept `--enable skills` (the feature-flag
 # name is rejected as unknown), so the skill files land on disk but are
