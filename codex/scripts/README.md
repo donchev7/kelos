@@ -24,7 +24,6 @@ itself once it is running.
 | `ALPHEYA_TOKEN_SIGNING_EXPIRES_IN` | Task `podOverrides.env` (literal) | `kelos-jwt`, `curl` (wrapper) | TTL in seconds. Default `3600`. Range `[60, 86400]`. |
 | `ALPHEYA_TOKEN_SIGNING_DEFAULT_CLAIMS` | Task `podOverrides.env` (literal JSON) | `kelos-jwt`, `curl` (wrapper) | `{"sub":...,"roles":[...],"email"?:...,"name"?:...,"ext"?:{...}}`. Required. The optional `ext` object is emitted as a nested claim verbatim (matches oauth2-proxy's token shape). |
 | `ALPHEYA_TOKEN_SIGNING_PROFILES` | Task `podOverrides.env` (literal JSON) | `kelos-jwt`, `curl` (wrapper) | Optional `{profileName: claims}` map for per-request identity. |
-| `ALPHEYA_TOKEN_SIGNING_HOSTS` | Task `podOverrides.env` (literal JSON or CSV) | `curl` (wrapper) | JSON map `{"host":"service"}` decoupling wire host from auth service name, OR CSV of hosts (service name = host). When unset, `curl` is a pure passthrough. |
 | `ALPHEYA_TOKEN_PROFILE` | Per-call env (literal) | `curl` (wrapper) | Optional. Appended as `:profile` to the resolved service before signing, for one-off privilege bumps. |
 
 All three GitHub App variables are mutually required — `kelos-agent-setup`
@@ -43,7 +42,7 @@ setup is skipped entirely and the container runs as before.
 
 Port of [`TokenSigningProvider`](../../../ai-agent/assay/src/adapters/auth/token-signing.ts) from `ai-agent/assay`. Built from Go sources in `internal/jwt/` and `cmd/kelos-{jwt,curl}/`; see those packages for the authoritative interface and tests.
 
-- **`/usr/local/bin/curl`** — Transparent wrapper that shadows `/usr/bin/curl` on `PATH`. For any URL whose host is in `ALPHEYA_TOKEN_SIGNING_HOSTS`, it mints a JWT and prepends `-H "Authorization: Bearer <jwt>"` before `syscall.Exec`'ing the real curl. Hosts not in the map (or no `HOSTS` env at all) → byte-for-byte passthrough, including exit code and TTY behavior. The agent calls plain `curl https://hermes-api.alpheya.com/...` and auth happens invisibly — same pattern as the `gh` wrapper.
+- **`/usr/local/bin/curl`** — Transparent wrapper that shadows `/usr/bin/curl` on `PATH`. When `ALPHEYA_TOKEN_SIGNING_ISSUER` is set, it mints a JWT and prepends `-H "Authorization: Bearer <jwt>"` for every http(s) URL before `syscall.Exec`'ing the real curl. Passthrough cases (byte-for-byte real curl, including exit code and TTY): no signing config, no URL in argv, or argv already carries an explicit `-H Authorization:` / `-u user:pass`. Agent-explicit auth wins over the wrapper.
 - **`/usr/local/bin/kelos-jwt`** — Explicit CLI for the cases where transparent injection is the wrong shape: embedding a JWT in a non-curl request, debug commands that want to inspect the minted token, or grpcurl (which the wrapper doesn't cover). Usage: `kelos-jwt sign <service[:profile]>`. Reads the same env contract.
 
 **`service:profile` syntax** (matches assay D-12): `kelos-jwt sign order-service` → `DEFAULT_CLAIMS`; `kelos-jwt sign order-service:admin` → `PROFILES.admin`, falls back to defaults if the profile is absent. For the curl wrapper, set `ALPHEYA_TOKEN_PROFILE=admin` on the invocation to apply the same suffix.
