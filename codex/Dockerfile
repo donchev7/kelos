@@ -138,6 +138,17 @@ RUN --mount=type=secret,id=github_token \
 ARG TARGETARCH
 COPY bin/kelos-capture-linux-${TARGETARCH} /kelos/kelos-capture
 
+# JWT signing helpers — port of ai-agent/assay TokenSigningProvider.
+# kelos-jwt: explicit CLI for shell scripts and debug commands.
+# kelos-curl: transparent curl wrapper installed AS /usr/local/bin/curl
+# so it shadows /usr/bin/curl on PATH; for hosts listed in
+# ALPHEYA_TOKEN_SIGNING_HOSTS it auto-injects `Authorization: Bearer
+# <jwt>` and exec's real curl. Config flows through TaskSpawner
+# podOverrides.env (see codex/scripts/README.md).
+COPY bin/kelos-jwt-linux-${TARGETARCH} /usr/local/bin/kelos-jwt
+COPY bin/kelos-curl-linux-${TARGETARCH} /usr/local/bin/curl
+RUN chmod +x /usr/local/bin/kelos-jwt /usr/local/bin/curl
+
 RUN useradd -u 61100 -m -s /bin/bash agent
 RUN mkdir -p /home/agent/.codex /home/agent/.local/bin && chown -R agent:agent /home/agent
 
