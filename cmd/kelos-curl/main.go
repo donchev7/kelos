@@ -1,27 +1,27 @@
-// kelos-curl — transparent curl wrapper that injects an Authorization
-// header for hosts listed in ALPHEYA_TOKEN_SIGNING_HOSTS.
+// kelos-curl — curl wrapper that injects an Authorization header
+// signed by internal/jwt for every outbound URL.
 //
-// This is the same shape as codex/scripts/gh: install it ahead of the
-// real binary on PATH (as /usr/local/bin/curl), and every curl
-// invocation from the agent picks up auth without the agent having to
-// remember to call a helper. The transparent design is the point —
-// pushing activation onto the LLM is the failure mode we hit with the
-// initial bash sign-jwt port.
+// Same shape as codex/scripts/gh: installed ahead of the real binary on
+// PATH (as /usr/local/bin/curl), so every curl invocation from the
+// agent picks up auth without the agent having to remember to call a
+// helper. The transparent design is the point — pushing activation
+// onto the LLM is the failure mode we hit with the initial bash port.
 //
 // Behavior:
-//   - ALPHEYA_TOKEN_SIGNING_HOSTS unset → exec real curl unchanged.
-//   - argv contains no http(s) URL → exec real curl unchanged.
-//   - URL host not in the HOSTS map → exec real curl unchanged.
-//   - URL host in HOSTS → mint JWT via internal/jwt, prepend
+//   - ALPHEYA_TOKEN_SIGNING_ISSUER unset → exec real curl unchanged
+//     (signing not configured; e.g., local dev or non-Alpheya agent images).
+//   - argv has no http(s) URL → exec real curl unchanged.
+//   - argv already carries Authorization (via -H/--header) or Basic
+//     auth (-u/--user) → exec real curl unchanged. Agent-explicit auth
+//     wins over the wrapper.
+//   - Otherwise → LoadConfigFromEnv + mint JWT, prepend
 //     `-H Authorization: Bearer <jwt>`, exec real curl.
-//   - HOSTS set but malformed, OR signing fails for a matched host →
-//     fail loudly. We never silently fall through to unauthenticated
-//     curl on a matched host, because that turns a misconfiguration
-//     into an auth-bypass.
+//   - Signing failure → fail loudly. Never silently fall through to
+//     unauthenticated curl — that turns a misconfiguration into an
+//     auth-bypass.
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	envHosts    = "ALPHEYA_TOKEN_SIGNING_HOSTS"
+	envIssuer   = "ALPHEYA_TOKEN_SIGNING_ISSUER"
 	envProfile  = "ALPHEYA_TOKEN_PROFILE"
 	envCurlBin  = "KELOS_CURL_REAL"
 	defaultCurl = "/usr/bin/curl"
@@ -60,8 +60,6 @@ func main() {
 	}
 }
 
-// mintFunc is a tiny seam so tests can drive maybeInjectAuth without
-// touching env vars or filesystem.
 type mintFunc func(service string) (string, error)
 
 func mintTokenFromEnv(service string) (string, error) {
@@ -79,13 +77,14 @@ func mintTokenFromEnv(service string) (string, error) {
 // maybeInjectAuth returns nil to mean "passthrough — no rewrite". A
 // non-nil slice is the new argv to exec with. Errors abort exec.
 func maybeInjectAuth(args []string, mint mintFunc) ([]string, error) {
-	hostsRaw := os.Getenv(envHosts)
-	if hostsRaw == "" {
+	// Signing not configured at all → passthrough. Picks one required
+	// env var as the gate so a partial configuration still trips
+	// LoadConfigFromEnv loudly below instead of silently skipping.
+	if os.Getenv(envIssuer) == "" {
 		return nil, nil
 	}
-	hosts, err := parseHosts(hostsRaw)
-	if err != nil {
-		return nil, err
+	if hasExplicitAuth(args) {
+		return nil, nil
 	}
 	target := firstURL(args)
 	if target == "" {
@@ -95,10 +94,10 @@ func maybeInjectAuth(args []string, mint mintFunc) ([]string, error) {
 	if err != nil || u.Host == "" {
 		return nil, nil
 	}
-	service, ok := hosts[u.Host]
-	if !ok {
-		return nil, nil
-	}
+	// Service name fed to the signer is the URL host. The Signer uses
+	// this only for `service:profile` lookup against config.Profiles;
+	// the host string itself does not land in the JWT.
+	service := u.Host
 	if profile := os.Getenv(envProfile); profile != "" {
 		service = service + ":" + profile
 	}
@@ -109,32 +108,39 @@ func maybeInjectAuth(args []string, mint mintFunc) ([]string, error) {
 	return append([]string{"-H", "Authorization: Bearer " + token}, args...), nil
 }
 
-// parseHosts accepts two formats:
-//   - JSON object: {"hermes-api.alpheya.com":"hermes",...}  → service name decoupled from host
-//   - CSV string:  hermes-api.alpheya.com,facade.alpheya.com → service name = host
-func parseHosts(raw string) (map[string]string, error) {
-	raw = strings.TrimSpace(raw)
-	if strings.HasPrefix(raw, "{") {
-		var m map[string]string
-		if err := json.Unmarshal([]byte(raw), &m); err != nil {
-			return nil, fmt.Errorf("%s: %w", envHosts, err)
+// hasExplicitAuth reports whether argv already carries an Authorization
+// header (via `-H`/`--header`) or HTTP Basic credentials (via
+// `-u`/`--user`). Either case means the agent is intentionally driving
+// auth itself; the wrapper steps aside rather than clobbering it.
+func hasExplicitAuth(args []string) bool {
+	for i, a := range args {
+		switch a {
+		case "-u", "--user":
+			return true
+		case "-H", "--header":
+			if i+1 < len(args) && headerIsAuthorization(args[i+1]) {
+				return true
+			}
 		}
-		return m, nil
-	}
-	m := map[string]string{}
-	for _, h := range strings.Split(raw, ",") {
-		h = strings.TrimSpace(h)
-		if h != "" {
-			m[h] = h
+		// Short-form `-Hkey:value` packs the header into one token.
+		if strings.HasPrefix(a, "-H") && len(a) > 2 && headerIsAuthorization(a[2:]) {
+			return true
+		}
+		if strings.HasPrefix(a, "--header=") && headerIsAuthorization(a[len("--header="):]) {
+			return true
 		}
 	}
-	return m, nil
+	return false
 }
 
-// firstURL scans argv for the first http/https token. Curl accepts URLs
-// positionally and via --url; both surface as a token starting with
-// http:// or https://, so a substring scan is enough — we don't need a
-// full curl-flag parser to identify the target host.
+func headerIsAuthorization(h string) bool {
+	// HTTP header names are case-insensitive. Trim leading whitespace
+	// since curl tolerates "Authorization:value" and " Authorization:v".
+	h = strings.TrimLeft(h, " \t")
+	return len(h) >= len("Authorization:") &&
+		strings.EqualFold(h[:len("Authorization:")], "Authorization:")
+}
+
 func firstURL(args []string) string {
 	for _, a := range args {
 		if strings.HasPrefix(a, "http://") || strings.HasPrefix(a, "https://") {
