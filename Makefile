@@ -84,6 +84,13 @@ IMAGE_PLATFORMS ?= linux/$(LOCAL_ARCH)
 IMAGE_ARCHES = $(shell echo "$(IMAGE_PLATFORMS)" | tr ',' '\n' | cut -d'/' -f2 | tr '\n' ' ')
 PUSH ?= false
 
+# Binaries pre-built into bin/<name>-linux-<arch> and COPY'd into agent
+# images. kelos-capture is captured by every agent runner; kelos-jwt and
+# kelos-curl are the JWT signing helpers (port of assay's
+# TokenSigningProvider, see internal/jwt). kelos-curl shadows real curl
+# at /usr/local/bin/curl so JWT injection is transparent to the agent.
+AGENT_IMAGE_BINARIES ?= kelos-capture kelos-jwt kelos-curl
+
 .PHONY: image
 image: ## Build docker images (use WHAT, IMAGE_PLATFORMS, PUSH=true to customize).
 	@for dir in $(filter cmd/%,$(or $(WHAT),$(IMAGE_DIRS))); do \
@@ -93,9 +100,11 @@ image: ## Build docker images (use WHAT, IMAGE_PLATFORMS, PUSH=true to customize
 			mv bin/$$name bin/$${name}-linux-$$arch; \
 		done; \
 	done
-	@for arch in $(IMAGE_ARCHES); do \
-		GOOS=linux GOARCH=$$arch $(MAKE) build WHAT=cmd/kelos-capture; \
-		mv bin/kelos-capture bin/kelos-capture-linux-$$arch; \
+	@for binary in $(AGENT_IMAGE_BINARIES); do \
+		for arch in $(IMAGE_ARCHES); do \
+			GOOS=linux GOARCH=$$arch $(MAKE) build WHAT=cmd/$$binary; \
+			mv bin/$$binary bin/$$binary-linux-$$arch; \
+		done; \
 	done
 	@for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
 		secret_flag=""; \
