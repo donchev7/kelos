@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -274,7 +275,31 @@ func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg confi
 		upstreamURL:   cfg.upstreamURL,
 		authorization: cfg.authorization,
 	}
-	resources, err := mcp.accessibleResources(ctx)
+
+	logger.Info("atlassian startup validation started",
+		"upstream_url", sanitizedURL(cfg.upstreamURL),
+		"expected_site", cfg.expectedSite,
+		"auth_scheme", authorizationScheme(cfg.authorization),
+	)
+	if err := mcp.initialize(ctx); err != nil {
+		return err
+	}
+	logger.Info("atlassian initialize succeeded", "session_id_received", mcp.sessionID != "")
+
+	if err := mcp.initialized(ctx); err != nil {
+		return err
+	}
+	logger.Info("atlassian initialized notification sent")
+
+	tools, err := mcp.listTools(ctx)
+	if err != nil {
+		logger.Warn("atlassian tools list failed", "error", err)
+	} else {
+		names := toolNames(tools)
+		logger.Info("atlassian tools listed", "tool_count", len(names), "tools", names, "payload_shape", payloadShape(tools))
+	}
+
+	resources, err := mcp.callAccessibleResources(ctx)
 	if err != nil {
 		return err
 	}
@@ -283,6 +308,11 @@ func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg confi
 		return err
 	}
 	hosts := atlassianHosts(resources)
+	logger.Info("atlassian accessible resources received",
+		"payload_shape", payloadShape(resources),
+		"host_count", len(hosts),
+		"hosts", sortedHosts(hosts),
+	)
 	if len(hosts) == 0 {
 		return errors.New("upstream returned no accessible Atlassian site URLs")
 	}
@@ -296,6 +326,25 @@ func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg confi
 	}
 	logger.Info("atlassian startup validation passed", "site", expectedHost)
 	return nil
+}
+
+func sanitizedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "invalid-url"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func authorizationScheme(value string) string {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return "unknown"
+	}
+	return fields[0]
 }
 
 func normalizedHost(raw string) (string, error) {
@@ -330,6 +379,82 @@ func atlassianHosts(value any) map[string]struct{} {
 	}
 	walk(value)
 	return hosts
+}
+
+func sortedHosts(hosts map[string]struct{}) []string {
+	out := make([]string, 0, len(hosts))
+	for host := range hosts {
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func toolNames(value any) []string {
+	var tools []any
+	switch typed := value.(type) {
+	case map[string]any:
+		tools, _ = typed["tools"].([]any)
+	case []any:
+		tools = typed
+	}
+
+	names := make([]string, 0, len(tools))
+	for _, item := range tools {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, ok := obj["name"].(string); ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func payloadShape(value any) string {
+	return valueShape(value, 0)
+}
+
+func valueShape(value any, depth int) string {
+	if depth >= 3 {
+		return valueType(value)
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		if len(keys) > 10 {
+			keys = append(keys[:10], "...")
+		}
+		return fmt.Sprintf("object(keys=%v)", keys)
+	case []any:
+		if len(typed) == 0 {
+			return "array(len=0)"
+		}
+		return fmt.Sprintf("array(len=%d, first=%s)", len(typed), valueShape(typed[0], depth+1))
+	case nil:
+		return "null"
+	default:
+		return valueType(value)
+	}
+}
+
+func valueType(value any) string {
+	switch value.(type) {
+	case string:
+		return "string"
+	case bool:
+		return "bool"
+	case float64, float32, int, int64, int32:
+		return "number"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
 }
 
 func atlassianHostFromString(raw string) (string, bool) {
@@ -369,6 +494,14 @@ func (c *atlassianMCPClient) accessibleResources(ctx context.Context) (any, erro
 	if err := c.initialized(ctx); err != nil {
 		return nil, err
 	}
+	return c.callAccessibleResources(ctx)
+}
+
+func (c *atlassianMCPClient) listTools(ctx context.Context) (any, error) {
+	return c.call(ctx, "tools/list", map[string]any{})
+}
+
+func (c *atlassianMCPClient) callAccessibleResources(ctx context.Context) (any, error) {
 	result, err := c.call(ctx, "tools/call", map[string]any{
 		"name":      "getAccessibleAtlassianResources",
 		"arguments": map[string]any{},
