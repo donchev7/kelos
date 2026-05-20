@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -22,20 +21,11 @@ const (
 	defaultAddr        = ":8080"
 	defaultUpstreamURL = "https://mcp.atlassian.com/v1/mcp"
 	defaultSiteURL     = "https://wgen4.atlassian.net"
-	payloadPreviewLen  = 300
 
 	envAddr          = "CODY_TOOLS_ADDR"
 	envUpstreamURL   = "CODY_TOOLS_ATLASSIAN_UPSTREAM_URL"
 	envAuthorization = "CODY_TOOLS_ATLASSIAN_AUTHORIZATION"
 	envExpectedSite  = "CODY_TOOLS_ATLASSIAN_EXPECTED_SITE_URL"
-)
-
-var (
-	authHeaderPattern     = regexp.MustCompile(`(?i)\b(authorization\s*[:=]\s*)(basic|bearer)\s+[A-Za-z0-9._~+/=-]+`)
-	genericAuthPattern    = regexp.MustCompile(`(?i)\b(basic|bearer)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	secretKeyValuePattern = regexp.MustCompile(`(?i)\b(api[_-]?token|access[_-]?token|refresh[_-]?token|password|secret|private[_-]?key)(["']?\s*[:=]\s*["']?)[^"',\s}]+`)
-	emailPattern          = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
-	whitespacePattern     = regexp.MustCompile(`\s+`)
 )
 
 var hopByHopHeaders = map[string]struct{}{
@@ -294,19 +284,17 @@ func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg confi
 	if err := mcp.initialize(ctx); err != nil {
 		return err
 	}
-	logger.Info("atlassian initialize succeeded", "session_id_received", mcp.sessionID != "")
 
 	if err := mcp.initialized(ctx); err != nil {
 		return err
 	}
-	logger.Info("atlassian initialized notification sent")
 
 	tools, err := mcp.listTools(ctx)
 	if err != nil {
 		logger.Warn("atlassian tools list failed", "error", err)
 	} else {
 		names := toolNames(tools)
-		logger.Info("atlassian tools listed", "tool_count", len(names), "tools", names, "payload_shape", payloadShape(tools))
+		logger.Info("atlassian tools listed", "tool_count", len(names), "required_tools_present", requiredToolsPresent(names))
 	}
 
 	resources, err := mcp.callAccessibleResources(ctx)
@@ -318,15 +306,10 @@ func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg confi
 		return err
 	}
 	hosts := atlassianHosts(resources)
-	logArgs := []any{
-		"payload_shape", payloadShape(resources),
+	logger.Info("atlassian accessible resources received",
 		"host_count", len(hosts),
 		"hosts", sortedHosts(hosts),
-	}
-	if preview := payloadPreview(resources); preview != "" {
-		logArgs = append(logArgs, "payload_preview", preview)
-	}
-	logger.Info("atlassian accessible resources received", logArgs...)
+	)
 	if len(hosts) == 0 {
 		return errors.New("upstream returned no accessible Atlassian site URLs")
 	}
@@ -427,83 +410,23 @@ func toolNames(value any) []string {
 	return names
 }
 
-func payloadShape(value any) string {
-	return valueShape(value, 0)
-}
-
-func payloadPreview(value any) string {
-	text, ok := value.(string)
-	if !ok {
-		return ""
+func requiredToolsPresent(names []string) bool {
+	required := map[string]bool{
+		"getAccessibleAtlassianResources": false,
+		"createJiraIssue":                 false,
+		"searchJiraIssuesUsingJql":        false,
 	}
-	text = strings.TrimSpace(whitespacePattern.ReplaceAllString(text, " "))
-	if text == "" {
-		return ""
-	}
-	text = sanitizeDiagnosticText(text)
-	return truncateRunes(text, payloadPreviewLen)
-}
-
-func sanitizeDiagnosticText(text string) string {
-	text = authHeaderPattern.ReplaceAllString(text, `${1}${2} [REDACTED]`)
-	text = genericAuthPattern.ReplaceAllString(text, `${1} [REDACTED]`)
-	text = secretKeyValuePattern.ReplaceAllString(text, `${1}${2}[REDACTED]`)
-	text = emailPattern.ReplaceAllString(text, `[EMAIL]`)
-	return text
-}
-
-func truncateRunes(text string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	runes := []rune(text)
-	if len(runes) <= max {
-		return text
-	}
-	if max <= 3 {
-		return string(runes[:max])
-	}
-	return string(runes[:max-3]) + "..."
-}
-
-func valueShape(value any, depth int) string {
-	if depth >= 3 {
-		return valueType(value)
-	}
-	switch typed := value.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(typed))
-		for key := range typed {
-			keys = append(keys, key)
+	for _, name := range names {
+		if _, ok := required[name]; ok {
+			required[name] = true
 		}
-		sort.Strings(keys)
-		if len(keys) > 10 {
-			keys = append(keys[:10], "...")
-		}
-		return fmt.Sprintf("object(keys=%v)", keys)
-	case []any:
-		if len(typed) == 0 {
-			return "array(len=0)"
-		}
-		return fmt.Sprintf("array(len=%d, first=%s)", len(typed), valueShape(typed[0], depth+1))
-	case nil:
-		return "null"
-	default:
-		return valueType(value)
 	}
-}
-
-func valueType(value any) string {
-	switch value.(type) {
-	case string:
-		return "string"
-	case bool:
-		return "bool"
-	case float64, float32, int, int64, int32:
-		return "number"
-	default:
-		return fmt.Sprintf("%T", value)
+	for _, present := range required {
+		if !present {
+			return false
+		}
 	}
+	return true
 }
 
 func atlassianHostFromString(raw string) (string, bool) {

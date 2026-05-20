@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -95,77 +94,12 @@ func TestAtlassianHosts(t *testing.T) {
 	}
 }
 
-func TestAtlassianStartupDiagnosticsDoNotLogAuthorization(t *testing.T) {
-	upstream := mockMCPServer(t, []any{
-		map[string]any{"url": "https://wgen4.atlassian.net"},
-	})
-	defer upstream.Close()
-
-	var logs bytes.Buffer
-	err := validateAtlassianAccess(context.Background(), upstream.Client(), config{
-		upstreamURL:   upstream.URL + "?private=query",
-		authorization: "Basic token",
-		expectedSite:  "https://wgen4.atlassian.net",
-	}, slog.New(slog.NewJSONHandler(&logs, nil)))
-	if err != nil {
-		t.Fatalf("validation failed: %v", err)
+func TestRequiredToolsPresent(t *testing.T) {
+	if !requiredToolsPresent([]string{"createJiraIssue", "getAccessibleAtlassianResources", "searchJiraIssuesUsingJql"}) {
+		t.Fatal("expected required tools to be present")
 	}
-	logText := logs.String()
-	if strings.Contains(logText, "Basic token") || strings.Contains(logText, "private=query") {
-		t.Fatalf("logs contain sensitive detail: %s", logText)
-	}
-	for _, want := range []string{
-		`"auth_scheme":"Basic"`,
-		`"session_id_received":true`,
-		`"tool_count":1`,
-		`"host_count":1`,
-		`"wgen4.atlassian.net"`,
-	} {
-		if !strings.Contains(logText, want) {
-			t.Fatalf("logs missing %s: %s", want, logText)
-		}
-	}
-}
-
-func TestAtlassianStartupDiagnosticsLogsSanitizedStringPayloadPreview(t *testing.T) {
-	upstream := mockMCPServer(t, "Authorization: Basic very-secret-token for user.name@example.com failed; api_token=secret-value")
-	defer upstream.Close()
-
-	var logs bytes.Buffer
-	err := validateAtlassianAccess(context.Background(), upstream.Client(), config{
-		upstreamURL:   upstream.URL,
-		authorization: "Basic token",
-		expectedSite:  "https://wgen4.atlassian.net",
-	}, slog.New(slog.NewJSONHandler(&logs, nil)))
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-	logText := logs.String()
-	for _, sensitive := range []string{"very-secret-token", "user.name@example.com", "secret-value"} {
-		if strings.Contains(logText, sensitive) {
-			t.Fatalf("logs contain sensitive detail %q: %s", sensitive, logText)
-		}
-	}
-	for _, want := range []string{
-		`"payload_shape":"string"`,
-		`"payload_preview":`,
-		`Basic [REDACTED]`,
-		`[EMAIL]`,
-		`api_token=[REDACTED]`,
-	} {
-		if !strings.Contains(logText, want) {
-			t.Fatalf("logs missing %s: %s", want, logText)
-		}
-	}
-}
-
-func TestPayloadPreviewTruncates(t *testing.T) {
-	preview := payloadPreview(strings.Repeat("x", payloadPreviewLen+10))
-	if len(preview) != payloadPreviewLen {
-		t.Fatalf("preview len = %d, want %d", len(preview), payloadPreviewLen)
-	}
-	if !strings.HasSuffix(preview, "...") {
-		t.Fatalf("preview should end with ellipsis: %q", preview)
+	if requiredToolsPresent([]string{"getTeamworkGraphContext", "getTeamworkGraphObject"}) {
+		t.Fatal("expected required tools to be missing")
 	}
 }
 
