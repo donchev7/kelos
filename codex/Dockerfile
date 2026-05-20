@@ -186,6 +186,20 @@ COPY bin/kelos-jwt-linux-${TARGETARCH} /usr/local/bin/kelos-jwt
 COPY bin/kelos-curl-linux-${TARGETARCH} /usr/local/bin/curl
 RUN chmod +x /usr/local/bin/kelos-jwt /usr/local/bin/curl
 
+# Move the real curl out of PATH and point the wrapper at its new home.
+# Without this, an agent (or stray script) typing `/usr/bin/curl` could
+# bypass JWT auth — the wrapper would not see the call at all. With the
+# binary at /usr/local/libexec/curl-real, `which curl` only ever resolves
+# to /usr/local/bin/curl (the kelos-curl wrapper); the wrapper itself
+# reaches the real binary via KELOS_CURL_REAL.
+#
+# Done late so the earlier RUN ... apt-get / curl ... layers see the
+# normal /usr/bin/curl. Build-time tooling is unaffected; only the
+# runtime PATH changes.
+RUN mkdir -p /usr/local/libexec \
+    && mv /usr/bin/curl /usr/local/libexec/curl-real
+ENV KELOS_CURL_REAL=/usr/local/libexec/curl-real
+
 RUN useradd -u 61100 -m -s /bin/bash agent
 RUN mkdir -p /home/agent/.codex /home/agent/.local/bin && chown -R agent:agent /home/agent
 
