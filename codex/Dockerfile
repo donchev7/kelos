@@ -46,6 +46,29 @@ RUN ARCH=$(dpkg --print-architecture) \
     && chmod +x /usr/local/bin/flux \
     && rm /tmp/flux.tgz
 
+# Helm — render and inspect charts (pinned to v3; Flux v2 HelmReleases and
+# the existing chart corpus target helm 3). Bumping to v4 needs a sweep of
+# the charts the agent might touch.
+ARG HELM_VERSION=v3.21.0
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" \
+    && tar -xzf /tmp/helm.tgz -C /tmp \
+    && mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm \
+    && chmod +x /usr/local/bin/helm \
+    && rm -rf /tmp/helm.tgz /tmp/linux-${ARCH}
+
+# grpcurl — call Connect RPC / gRPC services directly (hermes-api, facade,
+# etc.) for live API debugging. The kelos-curl JWT wrapper doesn't cover
+# grpcurl, so the agent uses `kelos-jwt sign <service>` and passes the
+# token via -H "Authorization: Bearer ...".
+ARG GRPCURL_VERSION=1.9.3
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in amd64) GRPC_ARCH=x86_64 ;; arm64) GRPC_ARCH=arm64 ;; esac \
+    && curl -fsSL -o /tmp/grpcurl.tgz "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPC_ARCH}.tar.gz" \
+    && tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl \
+    && chmod +x /usr/local/bin/grpcurl \
+    && rm /tmp/grpcurl.tgz
+
 # kubectl — pinned to a stable minor matching what the cluster runs.
 # Tasks that need cluster introspection use this against the in-cluster
 # API server via the mounted ServiceAccount token.
@@ -73,6 +96,17 @@ RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') \
 ARG PNPM_VERSION=10.27.0
 RUN npm install -g pnpm@${PNPM_VERSION}
 
+# uv — Python package + project manager used by ai-api, bank-ingestor, and
+# friends (their Makefiles invoke `uv sync` / `uv run pytest`). Static
+# binary so no apt or pip bootstrap is needed.
+ARG UV_VERSION=0.11.15
+RUN ARCH=$(uname -m) \
+    && curl -fsSL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${ARCH}-unknown-linux-gnu.tar.gz" \
+    && tar -xzf /tmp/uv.tgz -C /tmp \
+    && mv /tmp/uv-${ARCH}-unknown-linux-gnu/uv /tmp/uv-${ARCH}-unknown-linux-gnu/uvx /usr/local/bin/ \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx \
+    && rm -rf /tmp/uv.tgz /tmp/uv-${ARCH}-unknown-linux-gnu
+
 RUN ARCH=$(dpkg --print-architecture) \
     && TARBALL="go${GO_VERSION}.linux-${ARCH}.tar.gz" \
     && curl -fsSL -o "/tmp/${TARBALL}" "https://dl.google.com/go/${TARBALL}" \
@@ -97,13 +131,16 @@ RUN chmod +x /kelos_entrypoint.sh
 COPY codex/scripts/github-app-credential-helper /usr/local/bin/github-app-credential-helper
 COPY codex/scripts/github-app-token /usr/local/bin/github-app-token
 COPY codex/scripts/kelos-agent-setup /usr/local/bin/kelos-agent-setup
-# gh wrapper sits at /usr/local/bin/gh (ahead of /usr/bin/gh in PATH) so
-# every gh invocation picks up an App installation token automatically.
+# gh + npm wrappers sit at /usr/local/bin (ahead of /usr/bin in PATH) so
+# every `gh` invocation picks up an App installation token and every
+# `npm` invocation gets NODE_AUTH_TOKEN for the @quantum-wealth scope.
 COPY codex/scripts/gh /usr/local/bin/gh
+COPY codex/scripts/npm /usr/local/bin/npm
 RUN chmod +x /usr/local/bin/github-app-credential-helper \
     /usr/local/bin/github-app-token \
     /usr/local/bin/kelos-agent-setup \
-    /usr/local/bin/gh
+    /usr/local/bin/gh \
+    /usr/local/bin/npm
 
 # Alpheya engineering skills — baked at image build time into the
 # system-wide codex skills directory. Per https://developers.openai.com/codex/skills,
@@ -148,6 +185,20 @@ COPY bin/kelos-capture-linux-${TARGETARCH} /kelos/kelos-capture
 COPY bin/kelos-jwt-linux-${TARGETARCH} /usr/local/bin/kelos-jwt
 COPY bin/kelos-curl-linux-${TARGETARCH} /usr/local/bin/curl
 RUN chmod +x /usr/local/bin/kelos-jwt /usr/local/bin/curl
+
+# Move the real curl out of PATH and point the wrapper at its new home.
+# Without this, an agent (or stray script) typing `/usr/bin/curl` could
+# bypass JWT auth — the wrapper would not see the call at all. With the
+# binary at /usr/local/libexec/curl-real, `which curl` only ever resolves
+# to /usr/local/bin/curl (the kelos-curl wrapper); the wrapper itself
+# reaches the real binary via KELOS_CURL_REAL.
+#
+# Done late so the earlier RUN ... apt-get / curl ... layers see the
+# normal /usr/bin/curl. Build-time tooling is unaffected; only the
+# runtime PATH changes.
+RUN mkdir -p /usr/local/libexec \
+    && mv /usr/bin/curl /usr/local/libexec/curl-real
+ENV KELOS_CURL_REAL=/usr/local/libexec/curl-real
 
 RUN useradd -u 61100 -m -s /bin/bash agent
 RUN mkdir -p /home/agent/.codex /home/agent/.local/bin && chown -R agent:agent /home/agent
