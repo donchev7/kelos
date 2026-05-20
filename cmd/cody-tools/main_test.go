@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -94,6 +95,38 @@ func TestAtlassianHosts(t *testing.T) {
 	}
 }
 
+func TestAtlassianStartupDiagnosticsDoNotLogAuthorization(t *testing.T) {
+	upstream := mockMCPServer(t, []any{
+		map[string]any{"url": "https://wgen4.atlassian.net"},
+	})
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	err := validateAtlassianAccess(context.Background(), upstream.Client(), config{
+		upstreamURL:   upstream.URL + "?private=query",
+		authorization: "Basic token",
+		expectedSite:  "https://wgen4.atlassian.net",
+	}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("validation failed: %v", err)
+	}
+	logText := logs.String()
+	if strings.Contains(logText, "Basic token") || strings.Contains(logText, "private=query") {
+		t.Fatalf("logs contain sensitive detail: %s", logText)
+	}
+	for _, want := range []string{
+		`"auth_scheme":"Basic"`,
+		`"session_id_received":true`,
+		`"tool_count":1`,
+		`"host_count":1`,
+		`"wgen4.atlassian.net"`,
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("logs missing %s: %s", want, logText)
+		}
+	}
+}
+
 func TestValidateAtlassianAccessFailsForMultipleSites(t *testing.T) {
 	upstream := mockMCPServer(t, []any{
 		map[string]any{"url": "https://wgen4.atlassian.net"},
@@ -155,6 +188,16 @@ func mockMCPServer(t *testing.T, resources []any) *httptest.Server {
 				"id":      id,
 				"result": map[string]any{
 					"protocolVersion": "2025-06-18",
+				},
+			})
+		case "tools/list":
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result": map[string]any{
+					"tools": []any{
+						map[string]any{"name": "getAccessibleAtlassianResources"},
+					},
 				},
 			})
 		case "tools/call":
