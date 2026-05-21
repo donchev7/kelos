@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAtlassianHandlerInjectsServerSideAuth(t *testing.T) {
@@ -158,6 +160,117 @@ func TestAikidoHandlerRequiresServerSideAuth(t *testing.T) {
 	}
 }
 
+func TestAikidoHandlerMintsAndCachesOAuthToken(t *testing.T) {
+	var tokenRequests int
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenRequests++
+		assertAikidoTokenRequest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "token-1",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	var apiRequests int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiRequests++
+		if got := r.Header.Get("Authorization"); got != "Bearer token-1" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"items":[]}`))
+	}))
+	defer apiServer.Close()
+
+	cfg := config{
+		aikidoAPIBaseURL:   apiServer.URL + "/api/public/v1",
+		aikidoTokenURL:     tokenServer.URL + "/oauth/token",
+		aikidoClientID:     "client-id",
+		aikidoClientSecret: "client-secret",
+	}
+	s := &server{
+		cfg:         cfg,
+		httpClient:  apiServer.Client(),
+		aikidoOAuth: newAikidoOAuthClientCredentials(cfg, apiServer.Client()),
+		logger:      testLogger(),
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/aikido/open-issue-groups", nil)
+		rec := httptest.NewRecorder()
+		s.handleAikido(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d", i+1, rec.Code)
+		}
+	}
+	if tokenRequests != 1 {
+		t.Fatalf("tokenRequests = %d", tokenRequests)
+	}
+	if apiRequests != 2 {
+		t.Fatalf("apiRequests = %d", apiRequests)
+	}
+}
+
+func TestAikidoHandlerRefreshesOAuthTokenOnUnauthorized(t *testing.T) {
+	var tokenRequests int
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenRequests++
+		assertAikidoTokenRequest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "token-" + string(rune('0'+tokenRequests)),
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	var apiRequests int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiRequests++
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-1":
+			http.Error(w, "expired", http.StatusUnauthorized)
+		case "Bearer token-2":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"items":[]}`))
+		default:
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := config{
+		aikidoAPIBaseURL:   apiServer.URL + "/api/public/v1",
+		aikidoTokenURL:     tokenServer.URL + "/oauth/token",
+		aikidoClientID:     "client-id",
+		aikidoClientSecret: "client-secret",
+	}
+	s := &server{
+		cfg:         cfg,
+		httpClient:  apiServer.Client(),
+		aikidoOAuth: newAikidoOAuthClientCredentials(cfg, apiServer.Client()),
+		logger:      testLogger(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/aikido/open-issue-groups", nil)
+	rec := httptest.NewRecorder()
+
+	s.handleAikido(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if tokenRequests != 2 {
+		t.Fatalf("tokenRequests = %d", tokenRequests)
+	}
+	if apiRequests != 2 {
+		t.Fatalf("apiRequests = %d", apiRequests)
+	}
+}
+
 func TestAikidoHandlerBlocksRedirectsToUnexpectedHosts(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://evil.example/steal", http.StatusFound)
@@ -191,6 +304,41 @@ func TestAikidoAuthorizationFromEnv(t *testing.T) {
 	}
 	if got := aikidoAuthorizationFromEnv("", "Basic encoded"); got != "Basic encoded" {
 		t.Fatalf("preformatted authorization = %q", got)
+	}
+}
+
+func TestAikidoClientCredentialsFromEnv(t *testing.T) {
+	id, secret, err := aikidoClientCredentialsFromEnv("client-id:client-secret", "", "")
+	if err != nil {
+		t.Fatalf("credentials pair failed: %v", err)
+	}
+	if id != "client-id" || secret != "client-secret" {
+		t.Fatalf("id/secret = %q/%q", id, secret)
+	}
+
+	id, secret, err = aikidoClientCredentialsFromEnv("", "separate-id", "separate-secret")
+	if err != nil {
+		t.Fatalf("separate credentials failed: %v", err)
+	}
+	if id != "separate-id" || secret != "separate-secret" {
+		t.Fatalf("id/secret = %q/%q", id, secret)
+	}
+
+	if _, _, err := aikidoClientCredentialsFromEnv("bad", "", ""); err == nil {
+		t.Fatal("expected malformed credentials to fail")
+	}
+	if _, _, err := aikidoClientCredentialsFromEnv("", "id", ""); err == nil {
+		t.Fatal("expected partial credentials to fail")
+	}
+}
+
+func TestAikidoExpiresAt(t *testing.T) {
+	now := time.Date(2026, 5, 21, 0, 0, 0, 0, time.UTC)
+	if got := aikidoExpiresAt(now, 3600); !got.Equal(now.Add(59 * time.Minute)) {
+		t.Fatalf("expiresAt = %s", got)
+	}
+	if got := aikidoExpiresAt(now, 0); !got.Equal(now.Add(aikidoDefaultTokenTTL)) {
+		t.Fatalf("default expiresAt = %s", got)
 	}
 }
 
@@ -318,6 +466,34 @@ func mockMCPServer(t *testing.T, resources any) *httptest.Server {
 			t.Fatalf("unexpected method %q", method)
 		}
 	}))
+}
+
+func assertAikidoTokenRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Fatalf("method = %s", r.Method)
+	}
+	id, secret, ok := r.BasicAuth()
+	if !ok {
+		t.Fatal("missing Basic auth")
+	}
+	if id != "client-id" || secret != "client-secret" {
+		t.Fatalf("Basic auth = %q/%q", id, secret)
+	}
+	if got := r.Header.Get("Content-Type"); got != aikidoTokenRequestContentType {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if values.Get("grant_type") != "client_credentials" {
+		t.Fatalf("grant_type = %q", values.Get("grant_type"))
+	}
 }
 
 func mustJSON(t *testing.T, value any) string {

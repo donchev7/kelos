@@ -183,24 +183,32 @@ Cody task pods must not receive:
 
 ## Secret Model
 
-Key Vault should contain the raw Aikido API token:
+Key Vault should contain Aikido OAuth client credentials, not a short-lived
+access token:
 
 ```text
-cody-aikido-api-key = "<Aikido API token>"
+cody-aikido-api-client-credentials = "<client_id>:<client_secret>"
 ```
 
 ExternalSecrets should project that into:
 
 ```text
 Secret: kelos-system/cody-aikido-api
-Key:    AIKIDO_API_KEY
+Key:    CODY_TOOLS_AIKIDO_CLIENT_CREDENTIALS
 ```
 
-`cody-tools` then converts that into the upstream auth format required by
-Aikido. Phase 1 treats `AIKIDO_API_KEY` as a bearer token unless the value
-already includes an auth scheme. `CODY_TOOLS_AIKIDO_AUTHORIZATION` may be used
-as an exact full Authorization header when needed. The implementation should
-keep the auth-format decision inside `cody-tools`, not in Cody instructions.
+`cody-tools` uses those credentials with Aikido's OAuth token endpoint:
+
+```text
+POST https://app.aikido.dev/api/oauth/token
+Authorization: Basic <base64(client_id:client_secret)>
+grant_type=client_credentials
+```
+
+`cody-tools` then caches the returned access token, refreshes it before expiry,
+and retries once after an upstream `401`. `AIKIDO_API_KEY` and
+`CODY_TOOLS_AIKIDO_AUTHORIZATION` remain supported as compatibility fallbacks,
+but OAuth client credentials are the production path.
 
 ## Cody Instructions
 
@@ -242,11 +250,11 @@ Expected files in `k8s-platform-gitops/non-prod/kelos`:
 ```yaml
 - name: CODY_TOOLS_AIKIDO_API_BASE_URL
   value: https://app.aikido.dev/api/public/v1
-- name: AIKIDO_API_KEY
+- name: CODY_TOOLS_AIKIDO_CLIENT_CREDENTIALS
   valueFrom:
     secretKeyRef:
       name: cody-aikido-api
-      key: AIKIDO_API_KEY
+      key: CODY_TOOLS_AIKIDO_CLIENT_CREDENTIALS
 ```
 
 Do not add the Aikido secret to Cody TaskSpawner pod overrides.
@@ -265,7 +273,7 @@ Good log fields:
 
 Do not log:
 
-- `AIKIDO_API_KEY`
+- `AIKIDO_API_KEY` or Aikido OAuth client credentials
 - upstream Authorization header;
 - inbound headers;
 - response bodies;
@@ -303,7 +311,8 @@ Alpha Cody should not use the proxy for every generic ops debug request.
 
 - `kubectl kustomize non-prod/kelos` succeeds.
 - `ExternalSecret/kelos-system/cody-aikido-api` is applied.
-- `Deployment/kelos-system/cody-tools` receives `AIKIDO_API_KEY`.
+- `Deployment/kelos-system/cody-tools` receives
+  `CODY_TOOLS_AIKIDO_CLIENT_CREDENTIALS`.
 - Alpha Cody instructions mention the internal Aikido proxy.
 - Stable Cody is unchanged until alpha validation passes.
 
@@ -319,7 +328,7 @@ Alpha Cody should not use the proxy for every generic ops debug request.
 
 1. Implement read-only `/aikido/*` proxy in `cmd/cody-tools`.
 2. Build and push `docker.io/alpheya/cody-tools:main`.
-3. Add Key Vault secret `cody-aikido-api-key`.
+3. Add Key Vault secret `cody-aikido-api-client-credentials`.
 4. Merge gitops wiring for the `cody-tools` secret/env and alpha instructions.
 5. Confirm Flux applies the ExternalSecret and Deployment.
 6. Restart `deployment/cody-tools` if needed.
