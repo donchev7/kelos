@@ -229,14 +229,16 @@ Failure taxonomy should be stable and small:
 
 ## Roadmap
 
+Status tags reflect existing Cody behavior plus the active OTel PRs. Untagged bullets are not materially started yet.
+
 ### Phase 1: Basic Operational Traceability
 
 Goal: make every Cody run explainable end to end.
 
-- Correlate Slack request, Task, Job, Pod, agent runtime, and Slack response.
-- Capture safe OTel spans across Cody control-plane lifecycle.
-- Preserve existing Loki pod logs.
-- Add run IDs and trace IDs everywhere practical.
+- **[In flight]** Correlate Slack request, Task, Job, Pod, agent runtime, and Slack response.
+- **[In flight]** Capture safe OTel spans across Cody control-plane lifecycle.
+- **[Done]** Preserve existing Loki pod logs.
+- **[In flight]** Add run IDs and trace IDs everywhere practical.
 - Build a basic "Cody runs" Grafana view using existing Tempo/Loki/Grafana infrastructure.
 
 ### Phase 2: Run Records
