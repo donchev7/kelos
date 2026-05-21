@@ -145,6 +145,33 @@ func TestParseUsageMissingFile(t *testing.T) {
 	}
 }
 
+func TestSummarizeAgentRunCodex(t *testing.T) {
+	path := writeTempFile(t, `{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}
+{"type":"item.started","item":{"type":"command_execution","command":"kubectl get pods -n qa"}}
+{"type":"item.started","item":{"type":"command_execution","command":"/bin/bash -lc \"git status\""}}
+`)
+
+	got := summarizeAgentRun("codex", path)
+	if got.InputTokens != 100 {
+		t.Fatalf("InputTokens = %d, want 100", got.InputTokens)
+	}
+	if got.OutputTokens != 50 {
+		t.Fatalf("OutputTokens = %d, want 50", got.OutputTokens)
+	}
+	if got.TurnCount != 1 {
+		t.Fatalf("TurnCount = %d, want 1", got.TurnCount)
+	}
+	if got.CommandCount != 2 {
+		t.Fatalf("CommandCount = %d, want 2", got.CommandCount)
+	}
+	if got.CommandFamilies["kubectl"] != 1 {
+		t.Fatalf("kubectl command family count = %d, want 1", got.CommandFamilies["kubectl"])
+	}
+	if got.CommandFamilies["shell"] != 1 {
+		t.Fatalf("shell command family count = %d, want 1", got.CommandFamilies["shell"])
+	}
+}
+
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agent-output.jsonl")

@@ -22,6 +22,7 @@ import (
 	"github.com/kelos-dev/kelos/internal/controller"
 	"github.com/kelos-dev/kelos/internal/githubapp"
 	"github.com/kelos-dev/kelos/internal/logging"
+	"github.com/kelos-dev/kelos/internal/observability"
 	"github.com/kelos-dev/kelos/internal/telemetry"
 )
 
@@ -99,6 +100,16 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(opts)))
+
+	if shutdown, err := observability.Init(context.Background(), "kelos-controller"); err != nil {
+		setupLog.Error(err, "Unable to initialize OpenTelemetry, continuing without tracing")
+	} else {
+		defer func() {
+			if err := shutdown(context.Background()); err != nil {
+				setupLog.Error(err, "Unable to shutdown OpenTelemetry")
+			}
+		}()
+	}
 
 	// Parse resource flags.
 	var spawnerResources *corev1.ResourceRequirements

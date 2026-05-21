@@ -14,6 +14,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/observability"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -483,7 +486,7 @@ type SlackTaskReporter struct {
 
 // ReportTaskStatus checks a Task's current phase against its last reported
 // phase and creates or updates the Slack thread reply as needed.
-func (tr *SlackTaskReporter) ReportTaskStatus(ctx context.Context, task *kelosv1alpha1.Task) error {
+func (tr *SlackTaskReporter) ReportTaskStatus(ctx context.Context, task *kelosv1alpha1.Task) (retErr error) {
 	log := ctrl.Log.WithName("slack-reporter")
 
 	annotations := task.Annotations
@@ -513,6 +516,17 @@ func (tr *SlackTaskReporter) ReportTaskStatus(ctx context.Context, task *kelosv1
 		return nil
 	}
 
+	ctx = observability.ExtractContextFromAnnotations(ctx, annotations)
+	ctx, span := startSlackReportSpan(ctx, "kelos.slack.report_status", task,
+		attribute.String("kelos.slack.desired_phase", desiredPhase),
+	)
+	defer func() {
+		if retErr != nil {
+			observability.RecordError(span, retErr)
+		}
+		span.End()
+	}()
+
 	if annotations[AnnotationSlackReportPhase] == desiredPhase {
 		// Task is still running and we already posted the "accepted" message.
 		// Try to post a progress update from the agent's pod logs.
@@ -533,11 +547,13 @@ func (tr *SlackTaskReporter) ReportTaskStatus(ctx context.Context, task *kelosv1
 		if progressTS := tr.getProgressTS(task.UID); progressTS != "" {
 			log.Info("Updating Slack progress message with final result", "task", task.Name, "channel", channel, "phase", desiredPhase)
 			if err := tr.Reporter.UpdateMessage(ctx, channel, progressTS, msgs[0]); err != nil {
+				observability.RecordError(span, err)
 				log.Error(err, "Failed to update progress message with final result, posting new reply", "task", task.Name)
 			} else {
 				// Post any continuation messages as new thread replies.
 				for _, msg := range msgs[1:] {
 					if _, err := tr.Reporter.PostThreadReply(ctx, channel, threadTS, msg); err != nil {
+						observability.RecordError(span, err)
 						log.Error(err, "Failed to post continuation message", "task", task.Name)
 					}
 				}
@@ -612,10 +628,19 @@ func (tr *SlackTaskReporter) persistSlackReportingState(ctx context.Context, tas
 // records the message timestamp. Subsequent calls edit the same message
 // in-place so the thread stays clean. All errors are non-fatal — progress
 // updates are best-effort.
-func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelosv1alpha1.Task) error {
+func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelosv1alpha1.Task) (retErr error) {
 	if tr.ProgressReader == nil {
 		return nil
 	}
+
+	ctx = observability.ExtractContextFromAnnotations(ctx, task.Annotations)
+	ctx, span := startSlackReportSpan(ctx, "kelos.slack.progress_update", task)
+	defer func() {
+		if retErr != nil {
+			observability.RecordError(span, retErr)
+		}
+		span.End()
+	}()
 
 	log := ctrl.Log.WithName("slack-reporter")
 
@@ -637,11 +662,13 @@ func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelosv1al
 	}
 
 	text := tr.ProgressReader.ReadProgress(ctx, task.Namespace, podName, containerName, task.Spec.Type)
+	span.SetAttributes(attribute.Bool("kelos.slack.progress_present", text != ""))
 	if text == "" {
 		return nil
 	}
 
 	if !tr.shouldPostProgress(task.UID, text) {
+		span.SetAttributes(attribute.Bool("kelos.slack.progress_duplicate", true))
 		return nil
 	}
 
@@ -650,7 +677,9 @@ func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelosv1al
 	// If we already have a progress message for this task, edit it in-place.
 	if replyTS := tr.getProgressTS(task.UID); replyTS != "" {
 		log.V(1).Info("Updating Slack progress message", "task", task.Name)
+		span.SetAttributes(attribute.String("kelos.slack.action", "update_progress_message"))
 		if err := tr.Reporter.UpdateMessage(ctx, channel, replyTS, msg); err != nil {
+			observability.RecordError(span, err)
 			log.Error(err, "Failed to update Slack progress message", "task", task.Name)
 			// Clear the stale TS so the next tick posts a fresh reply.
 			tr.setProgressTS(task.UID, "")
@@ -665,8 +694,10 @@ func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelosv1al
 
 	// First progress update — post a new reply and record its timestamp.
 	log.V(1).Info("Posting Slack progress update", "task", task.Name)
+	span.SetAttributes(attribute.String("kelos.slack.action", "post_progress_reply"))
 	replyTS, err := tr.Reporter.PostThreadReply(ctx, channel, threadTS, msg)
 	if err != nil {
+		observability.RecordError(span, err)
 		log.Error(err, "Failed to post Slack progress update", "task", task.Name)
 		return nil
 	}
@@ -786,6 +817,10 @@ func (tr *SlackTaskReporter) UpdateActivityIndicator(ctx context.Context, task *
 		return
 	}
 
+	ctx = observability.ExtractContextFromAnnotations(ctx, annotations)
+	ctx, span := startSlackReportSpan(ctx, "kelos.slack.activity_update", task)
+	defer span.End()
+
 	podName := task.Status.PodName
 	if podName == "" {
 		return
@@ -802,6 +837,7 @@ func (tr *SlackTaskReporter) UpdateActivityIndicator(ctx context.Context, task *
 	}
 
 	text := tr.ActivityReader.ReadActivity(ctx, task.Namespace, podName, containerName, task.Spec.Type)
+	span.SetAttributes(attribute.Bool("kelos.slack.activity_present", text != ""))
 
 	tr.mu.Lock()
 	state := tr.activity[task.UID]
@@ -839,6 +875,7 @@ func (tr *SlackTaskReporter) UpdateActivityIndicator(ctx context.Context, task *
 	}
 
 	if err := tr.Reporter.UpdateMessage(ctx, channel, messageTS, msg); err != nil {
+		observability.RecordError(span, err)
 		log.V(1).Info("Failed to update activity indicator", "task", task.Name, "error", err)
 		return
 	}
@@ -933,4 +970,21 @@ func appendActivityContext(baseMsg SlackMessage, activityText string) SlackMessa
 	// Last block is not a context block — append a new one.
 	blocks = append(blocks, slack.NewContextBlock("", activityElement))
 	return SlackMessage{Text: baseMsg.Text, Blocks: blocks}
+}
+
+func startSlackReportSpan(ctx context.Context, name string, task *kelosv1alpha1.Task, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	spanAttrs := []attribute.KeyValue{
+		attribute.String("kelos.task.name", task.Name),
+		attribute.String("kelos.task.namespace", task.Namespace),
+		attribute.String("kelos.task.type", task.Spec.Type),
+		attribute.String("kelos.task.phase", string(task.Status.Phase)),
+	}
+	if task.Labels != nil {
+		if spawner := task.Labels["kelos.dev/taskspawner"]; spawner != "" {
+			spanAttrs = append(spanAttrs, attribute.String("kelos.taskspawner.name", spawner))
+		}
+	}
+	spanAttrs = append(spanAttrs, attrs...)
+	return observability.Tracer("github.com/kelos-dev/kelos/internal/reporting").
+		Start(ctx, name, trace.WithAttributes(spanAttrs...))
 }

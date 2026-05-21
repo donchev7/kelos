@@ -10,6 +10,8 @@ import (
 	"text/template"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,6 +29,7 @@ import (
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
 	"github.com/kelos-dev/kelos/internal/githubapp"
+	"github.com/kelos-dev/kelos/internal/observability"
 )
 
 const (
@@ -63,7 +66,7 @@ type TaskReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles Task reconciliation.
-func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx)
 
 	var task kelosv1alpha1.Task
@@ -75,6 +78,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		reconcileErrorsTotal.WithLabelValues("task").Inc()
 		return ctrl.Result{}, err
 	}
+	ctx = observability.ExtractContextFromAnnotations(ctx, task.Annotations)
+	ctx, span := startTaskSpan(ctx, "kelos.task.reconcile", &task)
+	defer func() {
+		if reconcileErr != nil {
+			observability.RecordError(span, reconcileErr)
+		}
+		span.End()
+	}()
 
 	// Handle deletion
 	if !task.DeletionTimestamp.IsZero() {
@@ -201,16 +212,26 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *kelosv1alpha1
 }
 
 // createJob creates a Job for the Task.
-func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task) (ctrl.Result, error) {
+func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task) (result ctrl.Result, retErr error) {
 	logger := log.FromContext(ctx)
+	ctx, span := startTaskSpan(ctx, "kelos.task.create_job", task)
+	defer func() {
+		if retErr != nil {
+			observability.RecordError(span, retErr)
+		}
+		span.End()
+	}()
 
 	var workspace *kelosv1alpha1.WorkspaceSpec
 	if task.Spec.WorkspaceRef != nil {
+		resolveCtx, resolveSpan := startTaskSpan(ctx, "kelos.task.resolve_workspace", task)
 		var ws kelosv1alpha1.Workspace
-		if err := r.Get(ctx, client.ObjectKey{
+		if err := r.Get(resolveCtx, client.ObjectKey{
 			Namespace: task.Namespace,
 			Name:      task.Spec.WorkspaceRef.Name,
 		}, &ws); err != nil {
+			observability.RecordError(resolveSpan, err)
+			resolveSpan.End()
 			if apierrors.IsNotFound(err) {
 				logger.Info("Workspace not found yet, requeuing", "workspace", task.Spec.WorkspaceRef.Name)
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -218,11 +239,17 @@ func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task
 			logger.Error(err, "Unable to fetch Workspace", "workspace", task.Spec.WorkspaceRef.Name)
 			return ctrl.Result{}, err
 		}
+		resolveSpan.End()
 		workspace = &ws.Spec
 
 		// Handle GitHub App authentication
 		if workspace.SecretRef != nil {
-			resolvedWorkspace, err := r.resolveGitHubAppToken(ctx, task, workspace)
+			tokenCtx, tokenSpan := startTaskSpan(ctx, "kelos.task.resolve_github_app_token", task)
+			resolvedWorkspace, err := r.resolveGitHubAppToken(tokenCtx, task, workspace)
+			if err != nil {
+				observability.RecordError(tokenSpan, err)
+			}
+			tokenSpan.End()
 			if err != nil {
 				logger.Error(err, "Unable to resolve GitHub App token")
 				r.recordEvent(task, corev1.EventTypeWarning, "GitHubTokenFailed", "Failed to resolve GitHub token: %v", err)
@@ -245,13 +272,16 @@ func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task
 
 	var agentConfig *kelosv1alpha1.AgentConfigSpec
 	if refs := ResolveAgentConfigRefs(&task.Spec); len(refs) > 0 {
+		configCtx, configSpan := startTaskSpan(ctx, "kelos.task.resolve_agentconfig", task, attribute.Int("kelos.agentconfig.count", len(refs)))
 		var specs []kelosv1alpha1.AgentConfigSpec
 		for _, ref := range refs {
 			var ac kelosv1alpha1.AgentConfig
-			if err := r.Get(ctx, client.ObjectKey{
+			if err := r.Get(configCtx, client.ObjectKey{
 				Namespace: task.Namespace,
 				Name:      ref.Name,
 			}, &ac); err != nil {
+				observability.RecordError(configSpan, err)
+				configSpan.End()
 				if apierrors.IsNotFound(err) {
 					logger.Info("AgentConfig not found yet, requeuing", "agentConfig", ref.Name)
 					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -263,9 +293,16 @@ func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task
 		}
 
 		agentConfig = MergeAgentConfigs(specs)
+		configSpan.SetAttributes(attribute.Int("kelos.mcp.server.count", len(agentConfig.MCPServers)))
+		configSpan.End()
 
 		if len(agentConfig.MCPServers) > 0 {
-			resolved, err := r.resolveMCPServerSecrets(ctx, task.Namespace, agentConfig.MCPServers)
+			mcpCtx, mcpSpan := startTaskSpan(ctx, "kelos.task.resolve_mcp_secrets", task, attribute.Int("kelos.mcp.server.count", len(agentConfig.MCPServers)))
+			resolved, err := r.resolveMCPServerSecrets(mcpCtx, task.Namespace, agentConfig.MCPServers)
+			if err != nil {
+				observability.RecordError(mcpSpan, err)
+			}
+			mcpSpan.End()
 			if err != nil {
 				logger.Error(err, "Unable to resolve MCP server secrets")
 				r.recordEvent(task, corev1.EventTypeWarning, "MCPSecretFailed", "Failed to resolve MCP server secret: %v", err)
@@ -286,9 +323,16 @@ func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task
 		}
 	}
 
+	promptCtx, promptSpan := startTaskSpan(ctx, "kelos.task.resolve_prompt", task)
 	resolvedPrompt := r.resolvePromptTemplate(ctx, task)
+	promptSpan.End()
 
+	_, buildSpan := startTaskSpan(promptCtx, "kelos.task.build_job", task)
 	job, err := r.JobBuilder.Build(task, workspace, agentConfig, resolvedPrompt)
+	if err != nil {
+		observability.RecordError(buildSpan, err)
+	}
+	buildSpan.End()
 	if err != nil {
 		logger.Error(err, "unable to build Job")
 		r.recordEvent(task, corev1.EventTypeWarning, "JobBuildFailed", "Failed to build Job: %v", err)
@@ -312,13 +356,17 @@ func (r *TaskReconciler) createJob(ctx context.Context, task *kelosv1alpha1.Task
 		return ctrl.Result{}, err
 	}
 
-	if err := r.Create(ctx, job); err != nil {
+	createCtx, createSpan := startTaskSpan(ctx, "kelos.task.create_k8s_job", task)
+	if err := r.Create(createCtx, job); err != nil {
+		observability.RecordError(createSpan, err)
+		createSpan.End()
 		if apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
 		logger.Error(err, "unable to create Job")
 		return ctrl.Result{}, err
 	}
+	createSpan.End()
 
 	logger.Info("created Job", "job", job.Name)
 	r.recordEvent(task, corev1.EventTypeNormal, "TaskCreated", "Created Job %s for task", job.Name)
@@ -475,8 +523,17 @@ func (r *TaskReconciler) resolveMCPServerSecrets(ctx context.Context, namespace 
 }
 
 // updateStatus updates Task status based on Job status.
-func (r *TaskReconciler) updateStatus(ctx context.Context, task *kelosv1alpha1.Task, job *batchv1.Job) (ctrl.Result, error) {
+func (r *TaskReconciler) updateStatus(ctx context.Context, task *kelosv1alpha1.Task, job *batchv1.Job) (result ctrl.Result, retErr error) {
 	logger := log.FromContext(ctx)
+	ctx, span := startTaskSpan(ctx, "kelos.task.status_transition", task,
+		attribute.String("kelos.task.previous_phase", string(task.Status.Phase)),
+	)
+	defer func() {
+		if retErr != nil {
+			observability.RecordError(span, retErr)
+		}
+		span.End()
+	}()
 
 	// Discover pod name for the task
 	var podName string
@@ -541,7 +598,13 @@ func (r *TaskReconciler) updateStatus(ctx context.Context, task *kelosv1alpha1.T
 			effectivePodName = task.Status.PodName
 		}
 		containerName := task.Spec.Type
-		outputs, results = r.readOutputs(ctx, task.Namespace, effectivePodName, containerName)
+		captureCtx, captureSpan := startTaskSpan(ctx, "kelos.task.capture_outputs", task)
+		outputs, results = r.readOutputs(captureCtx, task.Namespace, effectivePodName, containerName)
+		captureSpan.SetAttributes(
+			attribute.Int("kelos.task.output_count", len(outputs)),
+			attribute.Int("kelos.task.result_count", len(results)),
+		)
+		captureSpan.End()
 	}
 
 	// When retrying output capture, skip the status update if we still
@@ -579,6 +642,9 @@ func (r *TaskReconciler) updateStatus(ctx context.Context, task *kelosv1alpha1.T
 		logger.Error(err, "Unable to update Task status")
 		reconcileErrorsTotal.WithLabelValues("task").Inc()
 		return ctrl.Result{}, err
+	}
+	if phaseChanged {
+		span.SetAttributes(attribute.String("kelos.task.phase", string(newPhase)))
 	}
 
 	// Release branch lock when task reaches a terminal phase.
@@ -677,6 +743,26 @@ func (r *TaskReconciler) readOutputs(ctx context.Context, namespace, podName, co
 
 	outputs := ParseOutputs(string(data))
 	return outputs, ResultsFromOutputs(outputs)
+}
+
+func startTaskSpan(ctx context.Context, name string, task *kelosv1alpha1.Task, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	spanAttrs := []attribute.KeyValue{
+		attribute.String("kelos.task.name", task.Name),
+		attribute.String("kelos.task.namespace", task.Namespace),
+		attribute.String("kelos.task.type", task.Spec.Type),
+		attribute.String("kelos.task.phase", string(task.Status.Phase)),
+	}
+	if task.Spec.Model != "" {
+		spanAttrs = append(spanAttrs, attribute.String("kelos.agent.model", task.Spec.Model))
+	}
+	if task.Labels != nil {
+		if spawner := task.Labels["kelos.dev/taskspawner"]; spawner != "" {
+			spanAttrs = append(spanAttrs, attribute.String("kelos.taskspawner.name", spawner))
+		}
+	}
+	spanAttrs = append(spanAttrs, attrs...)
+	return observability.Tracer("github.com/kelos-dev/kelos/internal/controller").
+		Start(ctx, name, trace.WithAttributes(spanAttrs...))
 }
 
 // recordEvent records a Kubernetes Event on the given object if a Recorder is configured.

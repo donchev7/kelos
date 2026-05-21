@@ -75,9 +75,10 @@ process.exit(r.status ?? 1);
   printf '\n---KELOS_SETUP_COMMAND_DONE---\n' >&2
 fi
 
+AGENT_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 claude "${ARGS[@]}" | tee /tmp/agent-output.jsonl
 AGENT_EXIT_CODE=${PIPESTATUS[0]}
 
-/kelos/kelos-capture
+KELOS_AGENT_STARTED_AT="$AGENT_STARTED_AT" KELOS_AGENT_EXIT_CODE="$AGENT_EXIT_CODE" /kelos/kelos-capture
 
 exit $AGENT_EXIT_CODE

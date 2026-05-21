@@ -21,6 +21,7 @@ import (
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
 	"github.com/kelos-dev/kelos/internal/logging"
+	"github.com/kelos-dev/kelos/internal/observability"
 	"github.com/kelos-dev/kelos/internal/reporting"
 	kelosslack "github.com/kelos-dev/kelos/internal/slack"
 )
@@ -68,6 +69,16 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(opts)))
+
+	if shutdown, err := observability.Init(context.Background(), "kelos-slack-server"); err != nil {
+		setupLog.Error(err, "Unable to initialize OpenTelemetry, continuing without tracing")
+	} else {
+		defer func() {
+			if err := shutdown(context.Background()); err != nil {
+				setupLog.Error(err, "Unable to shutdown OpenTelemetry")
+			}
+		}()
+	}
 
 	botToken := os.Getenv("SLACK_BOT_TOKEN")
 	appToken := os.Getenv("SLACK_APP_TOKEN")
