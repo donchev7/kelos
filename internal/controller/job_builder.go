@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/observability"
 )
 
 const (
@@ -86,21 +87,32 @@ const (
 // because doing so would amount to executing arbitrary commands or code
 // inside the agent container before the user-supplied agent process runs.
 var reservedEnvNames = map[string]struct{}{
-	"KELOS_SETUP_COMMAND": {},
+	"KELOS_SETUP_COMMAND":  {},
+	"KELOS_TASK_NAME":      {},
+	"KELOS_TASK_NAMESPACE": {},
+	"OTEL_SERVICE_NAME":    {},
+	"TRACEPARENT":          {},
+	"TRACESTATE":           {},
+	"BAGGAGE":              {},
 }
 
 // JobBuilder constructs Kubernetes Jobs for Tasks.
 type JobBuilder struct {
-	ClaudeCodeImage           string
-	ClaudeCodeImagePullPolicy corev1.PullPolicy
-	CodexImage                string
-	CodexImagePullPolicy      corev1.PullPolicy
-	GeminiImage               string
-	GeminiImagePullPolicy     corev1.PullPolicy
-	OpenCodeImage             string
-	OpenCodeImagePullPolicy   corev1.PullPolicy
-	CursorImage               string
-	CursorImagePullPolicy     corev1.PullPolicy
+	ClaudeCodeImage                     string
+	ClaudeCodeImagePullPolicy           corev1.PullPolicy
+	CodexImage                          string
+	CodexImagePullPolicy                corev1.PullPolicy
+	GeminiImage                         string
+	GeminiImagePullPolicy               corev1.PullPolicy
+	OpenCodeImage                       string
+	OpenCodeImagePullPolicy             corev1.PullPolicy
+	CursorImage                         string
+	CursorImagePullPolicy               corev1.PullPolicy
+	AgentOTelTracesExporter             string
+	AgentOTelExporterOTLPEndpoint       string
+	AgentOTelExporterOTLPTracesEndpoint string
+	AgentOTelPropagators                string
+	AgentOTelResourceAttributes         string
 }
 
 // NewJobBuilder creates a new JobBuilder.
@@ -131,6 +143,38 @@ func (b *JobBuilder) Build(task *kelosv1alpha1.Task, workspace *kelosv1alpha1.Wo
 	default:
 		return nil, fmt.Errorf("unsupported agent type: %s", task.Spec.Type)
 	}
+}
+
+func agentRuntimeServiceName(agentType string) string {
+	if agentType == AgentTypeCodex {
+		return "cody-runtime"
+	}
+	return "kelos-agent-runtime"
+}
+
+func (b *JobBuilder) agentOTelEnvVars() []corev1.EnvVar {
+	values := []struct {
+		name  string
+		value string
+	}{
+		{name: "OTEL_TRACES_EXPORTER", value: b.AgentOTelTracesExporter},
+		{name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: b.AgentOTelExporterOTLPEndpoint},
+		{name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", value: b.AgentOTelExporterOTLPTracesEndpoint},
+		{name: "OTEL_PROPAGATORS", value: b.AgentOTelPropagators},
+		{name: "OTEL_RESOURCE_ATTRIBUTES", value: b.AgentOTelResourceAttributes},
+	}
+
+	envVars := make([]corev1.EnvVar, 0, len(values))
+	for _, v := range values {
+		if v.value == "" {
+			continue
+		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  v.name,
+			Value: v.value,
+		})
+	}
+	return envVars
 }
 
 // apiKeyEnvVar returns the environment variable name used for API key
@@ -272,6 +316,41 @@ func (b *JobBuilder) buildAgentJob(task *kelosv1alpha1.Task, workspace *kelosv1a
 		Name:  "KELOS_AGENT_TYPE",
 		Value: task.Spec.Type,
 	})
+	envVars = append(envVars,
+		corev1.EnvVar{
+			Name:  "KELOS_TASK_NAME",
+			Value: task.Name,
+		},
+		corev1.EnvVar{
+			Name:  "KELOS_TASK_NAMESPACE",
+			Value: task.Namespace,
+		},
+		corev1.EnvVar{
+			Name:  "OTEL_SERVICE_NAME",
+			Value: agentRuntimeServiceName(task.Spec.Type),
+		},
+	)
+	if task.Annotations != nil {
+		if traceParent := task.Annotations[observability.AnnotationTraceParent]; traceParent != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  observability.EnvTraceParent,
+				Value: traceParent,
+			})
+		}
+		if traceState := task.Annotations[observability.AnnotationTraceState]; traceState != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  observability.EnvTraceState,
+				Value: traceState,
+			})
+		}
+		if baggage := task.Annotations[observability.AnnotationBaggage]; baggage != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  observability.EnvBaggage,
+				Value: baggage,
+			})
+		}
+	}
+	envVars = append(envVars, b.agentOTelEnvVars()...)
 
 	if spawner := task.Labels["kelos.dev/taskspawner"]; spawner != "" {
 		envVars = append(envVars, corev1.EnvVar{
@@ -707,6 +786,7 @@ func (b *JobBuilder) buildAgentJob(task *kelosv1alpha1.Task, workspace *kelosv1a
 		"kelos.dev/managed-by": "kelos-controller",
 		"kelos.dev/task":       task.Name,
 	}
+	traceAnnotations := observability.TraceAnnotations(task.Annotations)
 
 	// Merge user-specified labels with built-in labels.
 	// Built-in labels take precedence over user-specified ones.
@@ -720,9 +800,10 @@ func (b *JobBuilder) buildAgentJob(task *kelosv1alpha1.Task, workspace *kelosv1a
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      task.Name,
-			Namespace: task.Namespace,
-			Labels:    jobLabels,
+			Name:        task.Name,
+			Namespace:   task.Namespace,
+			Labels:      jobLabels,
+			Annotations: traceAnnotations,
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:          &backoffLimit,
@@ -730,7 +811,8 @@ func (b *JobBuilder) buildAgentJob(task *kelosv1alpha1.Task, workspace *kelosv1a
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: jobLabels,
+					Labels:      jobLabels,
+					Annotations: traceAnnotations,
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyNever,

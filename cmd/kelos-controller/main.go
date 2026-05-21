@@ -22,6 +22,7 @@ import (
 	"github.com/kelos-dev/kelos/internal/controller"
 	"github.com/kelos-dev/kelos/internal/githubapp"
 	"github.com/kelos-dev/kelos/internal/logging"
+	"github.com/kelos-dev/kelos/internal/observability"
 	"github.com/kelos-dev/kelos/internal/telemetry"
 )
 
@@ -58,6 +59,11 @@ func main() {
 	var ghProxyResourceRequests string
 	var ghProxyResourceLimits string
 	var ghProxyCacheTTL time.Duration
+	var agentOTelTracesExporter string
+	var agentOTelExporterOTLPEndpoint string
+	var agentOTelExporterOTLPTracesEndpoint string
+	var agentOTelPropagators string
+	var agentOTelResourceAttributes string
 	var telemetryReport bool
 	var telemetryEndpoint string
 	var telemetryEnvironment string
@@ -86,6 +92,11 @@ func main() {
 	flag.StringVar(&ghProxyResourceRequests, "ghproxy-resource-requests", "", "Resource requests for workspace ghproxy containers as comma-separated name=value pairs (e.g., cpu=50m,memory=64Mi).")
 	flag.StringVar(&ghProxyResourceLimits, "ghproxy-resource-limits", "", "Resource limits for workspace ghproxy containers as comma-separated name=value pairs (e.g., cpu=200m,memory=128Mi).")
 	flag.DurationVar(&ghProxyCacheTTL, "ghproxy-cache-ttl", 0, "Cache TTL for workspace ghproxy instances (e.g., 30s, 1m). When set, passed as --cache-ttl to ghproxy containers. Zero means use the ghproxy default (15s).")
+	flag.StringVar(&agentOTelTracesExporter, "agent-otel-traces-exporter", "", "OTEL_TRACES_EXPORTER value injected into agent pods.")
+	flag.StringVar(&agentOTelExporterOTLPEndpoint, "agent-otel-exporter-otlp-endpoint", "", "OTEL_EXPORTER_OTLP_ENDPOINT value injected into agent pods.")
+	flag.StringVar(&agentOTelExporterOTLPTracesEndpoint, "agent-otel-exporter-otlp-traces-endpoint", "", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT value injected into agent pods.")
+	flag.StringVar(&agentOTelPropagators, "agent-otel-propagators", "", "OTEL_PROPAGATORS value injected into agent pods.")
+	flag.StringVar(&agentOTelResourceAttributes, "agent-otel-resource-attributes", "", "OTEL_RESOURCE_ATTRIBUTES value injected into agent pods.")
 	flag.BoolVar(&telemetryReport, "telemetry-report", false, "Run a one-shot telemetry report and exit.")
 	flag.StringVar(&telemetryEndpoint, "telemetry-endpoint", telemetry.DefaultPostHogEndpoint, "The PostHog endpoint for sending telemetry reports.")
 	flag.StringVar(&telemetryEnvironment, "telemetry-environment", "production", "The environment label for telemetry reports (e.g., production, development).")
@@ -99,6 +110,16 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(opts)))
+
+	if shutdown, err := observability.Init(context.Background(), "kelos-controller"); err != nil {
+		setupLog.Error(err, "Unable to initialize OpenTelemetry, continuing without tracing")
+	} else {
+		defer func() {
+			if err := shutdown(context.Background()); err != nil {
+				setupLog.Error(err, "Unable to shutdown OpenTelemetry")
+			}
+		}()
+	}
 
 	// Parse resource flags.
 	var spawnerResources *corev1.ResourceRequirements
@@ -195,6 +216,11 @@ func main() {
 	jobBuilder.OpenCodeImagePullPolicy = corev1.PullPolicy(openCodeImagePullPolicy)
 	jobBuilder.CursorImage = cursorImage
 	jobBuilder.CursorImagePullPolicy = corev1.PullPolicy(cursorImagePullPolicy)
+	jobBuilder.AgentOTelTracesExporter = agentOTelTracesExporter
+	jobBuilder.AgentOTelExporterOTLPEndpoint = agentOTelExporterOTLPEndpoint
+	jobBuilder.AgentOTelExporterOTLPTracesEndpoint = agentOTelExporterOTLPTracesEndpoint
+	jobBuilder.AgentOTelPropagators = agentOTelPropagators
+	jobBuilder.AgentOTelResourceAttributes = agentOTelResourceAttributes
 	if err = (&controller.TaskReconciler{
 		Client:       mgr.GetClient(),
 		Scheme:       mgr.GetScheme(),

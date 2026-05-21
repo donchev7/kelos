@@ -109,6 +109,53 @@ func TestRender_PullPolicy(t *testing.T) {
 	}
 }
 
+func TestRender_OTelValues(t *testing.T) {
+	vals := map[string]interface{}{
+		"controller": map[string]interface{}{
+			"env": []interface{}{
+				map[string]interface{}{
+					"name":  "OTEL_SERVICE_NAME",
+					"value": "kelos-controller",
+				},
+			},
+			"agentOtel": map[string]interface{}{
+				"tracesExporter":             "otlp",
+				"exporterOtlpEndpoint":       "http://otel-collector:4318",
+				"propagators":                "tracecontext,baggage",
+				"resourceAttributes":         "deployment.environment=test",
+				"exporterOtlpTracesEndpoint": "",
+			},
+		},
+		"slackServer": map[string]interface{}{
+			"enabled":    true,
+			"secretName": "cody-slack-tokens",
+			"env": []interface{}{
+				map[string]interface{}{
+					"name":  "OTEL_SERVICE_NAME",
+					"value": "kelos-slack-server",
+				},
+			},
+		},
+	}
+	data, err := Render(manifests.ChartFS, vals)
+	if err != nil {
+		t.Fatalf("rendering chart: %v", err)
+	}
+	output := string(data)
+	for _, expected := range []string{
+		"--agent-otel-traces-exporter=otlp",
+		"--agent-otel-exporter-otlp-endpoint=http://otel-collector:4318",
+		"--agent-otel-propagators=tracecontext,baggage",
+		"--agent-otel-resource-attributes=deployment.environment=test",
+		"value: kelos-controller",
+		"value: kelos-slack-server",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected rendered output to contain %q", expected)
+		}
+	}
+}
+
 func TestRender_DisableTelemetry(t *testing.T) {
 	vals := map[string]interface{}{
 		"telemetry": map[string]interface{}{

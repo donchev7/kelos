@@ -14,10 +14,13 @@ import (
 	goslack "github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/observability"
 	"github.com/kelos-dev/kelos/internal/reporting"
 	"github.com/kelos-dev/kelos/internal/taskbuilder"
 )
@@ -174,19 +177,27 @@ func (h *SlackHandler) handleMessageEvent(ctx context.Context, innerEvent *slack
 
 	// Enrich message with user info, permalink, channel name
 	msg := h.enrichMessage(ctx, innerEvent)
+	ctx, span := h.startSlackRequestSpan(ctx, msg)
+	defer span.End()
 
 	// For thread replies, fetch full thread context so the agent sees
 	// the entire conversation. Spawner filters (mention + triggers)
 	// decide whether to process the message.
 	if innerEvent.ThreadTimeStamp != "" {
-		body, err := FetchThreadContext(ctx, h.api, innerEvent.Channel, innerEvent.ThreadTimeStamp, h.botUserID)
+		threadCtx, threadSpan := observability.Tracer("github.com/kelos-dev/kelos/internal/slack").
+			Start(ctx, "kelos.slack.fetch_thread_context")
+		body, err := FetchThreadContext(threadCtx, h.api, innerEvent.Channel, innerEvent.ThreadTimeStamp, h.botUserID)
 		if err != nil {
+			observability.RecordError(threadSpan, err)
 			h.log.Error(err, "Failed to fetch thread context, falling back to message text",
 				"channel", innerEvent.Channel, "threadTS", innerEvent.ThreadTimeStamp)
 		} else {
 			msg.Body = body
 			msg.HasThreadContext = true
+			span.SetAttributes(attribute.Bool("slack.has_thread_context", true))
+			threadSpan.SetAttributes(attribute.Bool("slack.thread_context", true))
 		}
+		threadSpan.End()
 	}
 
 	h.routeMessage(ctx, msg)
@@ -237,10 +248,17 @@ func (h *SlackHandler) routeMessage(ctx context.Context, msg *SlackMessageData) 
 
 	for _, spawner := range spawners {
 		spawnerLog := h.log.WithValues("spawner", spawner.Name, "namespace", spawner.Namespace)
+		matchCtx, matchSpan := observability.Tracer("github.com/kelos-dev/kelos/internal/slack").
+			Start(ctx, "kelos.slack.match_spawner", trace.WithAttributes(
+				attribute.String("kelos.taskspawner.name", spawner.Name),
+				attribute.String("kelos.task.namespace", spawner.Namespace),
+			))
 
 		// Check if suspended
 		if spawner.Spec.Suspend != nil && *spawner.Spec.Suspend {
 			spawnerLog.V(1).Info("Skipping suspended TaskSpawner")
+			matchSpan.SetAttributes(attribute.String("kelos.slack.match_outcome", "suspended"))
+			matchSpan.End()
 			continue
 		}
 
@@ -250,6 +268,8 @@ func (h *SlackHandler) routeMessage(ctx context.Context, msg *SlackMessageData) 
 				spawnerLog.Info("Max concurrency reached, dropping message",
 					"activeTasks", spawner.Status.ActiveTasks,
 					"maxConcurrency", *spawner.Spec.MaxConcurrency)
+				matchSpan.SetAttributes(attribute.String("kelos.slack.match_outcome", "max_concurrency"))
+				matchSpan.End()
 				continue
 			}
 		}
@@ -260,17 +280,23 @@ func (h *SlackHandler) routeMessage(ctx context.Context, msg *SlackMessageData) 
 		if !MatchesSpawner(slackCfg, msg, h.botUserID) {
 			spawnerLog.V(1).Info("Message did not match spawner filters",
 				"channel", msg.ChannelID, "triggerCount", len(slackCfg.Triggers))
+			matchSpan.SetAttributes(attribute.String("kelos.slack.match_outcome", "not_matched"))
+			matchSpan.End()
 			continue
 		}
+		matchSpan.SetAttributes(attribute.String("kelos.slack.match_outcome", "matched"))
 
 		taskMsg := *msg
 
 		spawnerLog.Info("Message matches TaskSpawner — creating task", "channel", msg.ChannelID, "user", msg.UserID)
 
-		if err := h.createTask(ctx, spawner, &taskMsg); err != nil {
+		if err := h.createTask(matchCtx, spawner, &taskMsg); err != nil {
+			observability.RecordError(matchSpan, err)
 			spawnerLog.Error(err, "Failed to create task")
+			matchSpan.End()
 			continue
 		}
+		matchSpan.End()
 	}
 }
 
@@ -294,6 +320,13 @@ func (h *SlackHandler) getMatchingSpawners(ctx context.Context) ([]*v1alpha1.Tas
 
 // createTask creates a Task for the given TaskSpawner from a Slack message.
 func (h *SlackHandler) createTask(ctx context.Context, spawner *v1alpha1.TaskSpawner, msg *SlackMessageData) error {
+	ctx, span := observability.Tracer("github.com/kelos-dev/kelos/internal/slack").
+		Start(ctx, "kelos.task.create", trace.WithAttributes(
+			attribute.String("kelos.taskspawner.name", spawner.Name),
+			attribute.String("kelos.task.namespace", spawner.Namespace),
+		))
+	defer span.End()
+
 	templateVars := ExtractSlackWorkItem(msg)
 
 	// Build unique task name using a hash of the message identifier
@@ -338,6 +371,7 @@ func (h *SlackHandler) createTask(ctx context.Context, spawner *v1alpha1.TaskSpa
 	if task.Annotations == nil {
 		task.Annotations = make(map[string]string)
 	}
+	observability.InjectContextToAnnotations(ctx, task.Annotations)
 	task.Annotations[reporting.AnnotationSlackReporting] = "enabled"
 	task.Annotations[reporting.AnnotationSlackChannel] = msg.ChannelID
 	task.Annotations[reporting.AnnotationSlackUserID] = msg.UserID
@@ -359,6 +393,7 @@ func (h *SlackHandler) createTask(ctx context.Context, spawner *v1alpha1.TaskSpa
 	}
 
 	if err := h.client.Create(ctx, task); err != nil {
+		observability.RecordError(span, err)
 		if apierrors.IsAlreadyExists(err) {
 			h.log.Info("Task already exists, skipping", "task", taskName)
 			return nil
@@ -366,8 +401,22 @@ func (h *SlackHandler) createTask(ctx context.Context, spawner *v1alpha1.TaskSpa
 		return fmt.Errorf("Creating task: %w", err)
 	}
 
+	span.SetAttributes(attribute.String("kelos.task.name", task.Name))
 	h.log.Info("Created task from Slack message", "task", taskName, "spawner", spawner.Name)
 	return nil
+}
+
+func (h *SlackHandler) startSlackRequestSpan(ctx context.Context, msg *SlackMessageData) (context.Context, trace.Span) {
+	attrs := []attribute.KeyValue{
+		attribute.Bool("main", true),
+		attribute.String("slack.channel_id_hash", observability.HashID(msg.ChannelID)),
+		attribute.String("slack.user_id_hash", observability.HashID(msg.UserID)),
+		attribute.Bool("slack.thread_ts_present", msg.ThreadTS != ""),
+		attribute.Bool("slack.has_thread_context", msg.HasThreadContext),
+		attribute.Bool("slack.is_slash_command", msg.IsSlashCommand),
+	}
+	return observability.Tracer("github.com/kelos-dev/kelos/internal/slack").
+		Start(ctx, "cody.slack.request", trace.WithAttributes(attrs...))
 }
 
 // enrichMessage builds a SlackMessageData from a raw Slack message event,

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/observability"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -5146,5 +5147,73 @@ func TestBuildJob_PodOverridesContainerSecurityContext(t *testing.T) {
 	}
 	if csc.Capabilities == nil || len(csc.Capabilities.Drop) != 1 || csc.Capabilities.Drop[0] != "ALL" {
 		t.Errorf("Expected Capabilities.Drop=[ALL], got %+v", csc.Capabilities)
+	}
+}
+
+func TestBuildJob_PropagatesTraceContextAndOTelEnv(t *testing.T) {
+	builder := NewJobBuilder()
+	builder.AgentOTelTracesExporter = "otlp"
+	builder.AgentOTelExporterOTLPEndpoint = "http://otel-collector:4318"
+	builder.AgentOTelPropagators = "tracecontext,baggage"
+	builder.AgentOTelResourceAttributes = "deployment.environment=test"
+
+	task := &kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-otel",
+			Namespace: "default",
+			Annotations: map[string]string{
+				observability.AnnotationTraceParent: "00-11111111111111111111111111111111-2222222222222222-01",
+				observability.AnnotationTraceState:  "vendor=value",
+				observability.AnnotationBaggage:     "tenant=qa",
+			},
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": "cody-debug-slack",
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   AgentTypeCodex,
+			Prompt: "Trace this",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: &kelosv1alpha1.SecretReference{Name: "codex-auth"},
+			},
+		},
+	}
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	env := map[string]string{}
+	for _, item := range job.Spec.Template.Spec.Containers[0].Env {
+		env[item.Name] = item.Value
+	}
+
+	want := map[string]string{
+		"KELOS_TASK_NAME":             "test-otel",
+		"KELOS_TASK_NAMESPACE":        "default",
+		"KELOS_TASKSPAWNER":           "cody-debug-slack",
+		"KELOS_AGENT_TYPE":            AgentTypeCodex,
+		"OTEL_SERVICE_NAME":           "cody-runtime",
+		"OTEL_TRACES_EXPORTER":        "otlp",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
+		"OTEL_PROPAGATORS":            "tracecontext,baggage",
+		"OTEL_RESOURCE_ATTRIBUTES":    "deployment.environment=test",
+		observability.EnvTraceParent:  "00-11111111111111111111111111111111-2222222222222222-01",
+		observability.EnvTraceState:   "vendor=value",
+		observability.EnvBaggage:      "tenant=qa",
+	}
+	for name, value := range want {
+		if env[name] != value {
+			t.Fatalf("env %s = %q, want %q", name, env[name], value)
+		}
+	}
+
+	if job.Annotations[observability.AnnotationTraceParent] != want[observability.EnvTraceParent] {
+		t.Fatalf("job traceparent annotation = %q, want %q", job.Annotations[observability.AnnotationTraceParent], want[observability.EnvTraceParent])
+	}
+	if job.Spec.Template.Annotations[observability.AnnotationBaggage] != "tenant=qa" {
+		t.Fatalf("pod template baggage annotation = %q, want tenant=qa", job.Spec.Template.Annotations[observability.AnnotationBaggage])
 	}
 }
