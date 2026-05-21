@@ -3,6 +3,7 @@
 ## Status
 
 Draft implementation spec for Phase 1 of Cody shared context and memory.
+Validated against upstream Hindsight OSS/docs on 2026-05-21.
 
 This builds on [2026-05-21-12-15-cody-shared-context-memory-spec.md](./2026-05-21-12-15-cody-shared-context-memory-spec.md).
 
@@ -48,8 +49,8 @@ Hindsight, not Cody-generated memory and not raw source ingestion.
 
 Humans should write records through one of these admin paths:
 
-- the upstream Hindsight CLI, if it supports the required retain/update
-  workflow cleanly;
+- the upstream Hindsight CLI (`hindsight memory retain ...`) for the first
+  spike;
 - a thin internal CLI wrapper around Hindsight's API;
 - a one-off admin script used by platform maintainers.
 
@@ -62,8 +63,8 @@ Rationale:
   reflection/evaluation paths.
 - Manual writes preserve the original Phase 1 product goal: curated facts only.
 - A CLI/admin path is faster than building an admin UI.
-- Keeping Cody behind `cody-tools` lets us enforce read-only access even if
-  Hindsight exposes write APIs elsewhere.
+- Hindsight has native MCP tool allowlisting; keeping Cody behind `cody-tools`
+  gives us a second policy boundary and keeps credentials out of task pods.
 
 Recommended initial Hindsight bank:
 
@@ -91,8 +92,14 @@ MCP surface.
 Recommended deployment shape:
 
 - Hindsight runs in `kelos-system`.
-- Hindsight stores the curated bank in its configured backing store.
-- A maintainer writes curated facts through an admin CLI/API path.
+- Hindsight is deployed with the upstream Helm chart
+  `oci://ghcr.io/vectorize-io/charts/hindsight`.
+- Hindsight API/MCP listens on port `8888`; the control-plane UI is separate
+  and should not be exposed for Phase 1.
+- For the non-prod spike, use the chart-managed PostgreSQL unless we decide to
+  move directly to CNPG/external PostgreSQL.
+- A maintainer writes curated facts through the upstream Hindsight CLI or a
+  small admin wrapper.
 - `cody-tools` exposes a narrow `cody-context` MCP facade that queries
   Hindsight but does not expose Hindsight write tools.
 - Cody never talks to Hindsight directly.
@@ -101,7 +108,7 @@ Recommended deployment shape:
 flowchart LR
   Human["Engineer writes curated fact"] --> CLI["Hindsight CLI / internal admin CLI"]
   CLI --> Bank["Hindsight bank: manually-created"]
-  Bank --> Hindsight["Hindsight API"]
+  Bank --> Hindsight["Hindsight API/MCP on :8888"]
   Hindsight --> MCP["cody-tools /mcp/context read-only facade"]
   MCP --> Cody["Cody task pod"]
 ```
@@ -159,6 +166,17 @@ Use Hindsight single-bank mode against the `manually-created` bank. Cody should
 not receive a generic multi-bank endpoint and should not be able to select
 arbitrary banks.
 
+Hindsight single-bank mode removes multi-bank tools such as `list_banks`,
+`create_bank`, and `get_bank_stats`, but it still exposes write/admin tools by
+default. Phase 1 must therefore use Hindsight's native MCP tool allowlist and
+`cody-tools` defense-in-depth filtering.
+
+Native Hindsight server allowlist:
+
+```text
+HINDSIGHT_API_MCP_ENABLED_TOOLS=recall,list_memories,get_memory,list_tags,get_bank
+```
+
 Allowed Hindsight tools:
 
 - `recall`
@@ -204,6 +222,9 @@ necessary.
 - All forwarded calls are forced to the `manually-created` bank.
 - Requests for disallowed tools return a clear "not available in Phase 1" error.
 - Tool names and schemas should remain Hindsight-compatible where practical.
+- It strips caller-provided `Authorization` / `Cookie` headers and injects the
+  server-side Hindsight MCP token, matching the existing Atlassian proxy
+  pattern.
 
 This keeps future portability high: if we later choose to expose Hindsight
 directly, Cody's learned tool usage still maps to Hindsight's native surface.
@@ -228,6 +249,9 @@ section while Hindsight owns storage, indexing, and retrieval behavior.
 Guardrails:
 
 - Hindsight is deployed in `kelos-system`.
+- Hindsight MCP is protected with `HINDSIGHT_API_MCP_AUTH_TOKEN`.
+- Hindsight MCP globally exposes only the Phase 1 read allowlist through
+  `HINDSIGHT_API_MCP_ENABLED_TOOLS`.
 - `cody-tools` remains healthy if Hindsight is missing or unavailable.
 - `/mcp/atlassian` remains unaffected by `/mcp/context` failures.
 - Hindsight write credentials are not mounted into Cody task pods.
@@ -298,7 +322,7 @@ Phase 1 writes should be explicitly human-initiated.
 
 Allowed write paths:
 
-- a Hindsight CLI command run by a platform maintainer;
+- an upstream Hindsight CLI command run by a platform maintainer;
 - an internal `cody-memory` CLI wrapper that validates required metadata before
   calling Hindsight;
 - a small admin-only script for initial seeding.
@@ -311,7 +335,18 @@ Disallowed write paths:
 - automatic post-run memory capture;
 - broad repo/doc crawlers.
 
-Recommended CLI wrapper behavior:
+Recommended upstream CLI spike:
+
+```text
+hindsight configure --api-url http://<port-forwarded-hindsight-api>:8888 --api-key <admin-api-key>
+hindsight memory retain manually-created "Curated context body..." --context "owner=shan status=active source=..."
+```
+
+The upstream CLI is enough for the first manual-write spike. Build
+`cody-memory` only when we need stronger local validation, required metadata,
+or audit/export behavior.
+
+Recommended future CLI wrapper behavior:
 
 - require `type`, `title`, `summary`, `body`, `owner`, `status`, `scope`,
   `tags`, and at least one source reference;
@@ -414,6 +449,43 @@ MCP proxy:
 - Use Hindsight single-bank mode for `manually-created`, so Cody cannot choose
   another bank.
 
+### Hindsight Runtime Configuration
+
+Validated upstream runtime facts:
+
+| Item | Validated value |
+| --- | --- |
+| Helm chart | `oci://ghcr.io/vectorize-io/charts/hindsight` |
+| Chart version checked | `0.6.2` in upstream repo at validation time |
+| API image | `ghcr.io/vectorize-io/hindsight-api` |
+| Standalone image | `ghcr.io/vectorize-io/hindsight` |
+| API/MCP port | `8888` |
+| MCP root path | `/mcp` |
+| Single-bank MCP path | `/mcp/{bank_id}/` |
+| Phase 1 bank path | `/mcp/manually-created/` |
+| Control-plane UI | separate service; do not expose for Phase 1 |
+
+Recommended Hindsight env for Phase 1:
+
+| Env var | Purpose |
+| --- | --- |
+| `HINDSIGHT_API_MCP_ENABLED` | Keep MCP enabled; default is already `true`. |
+| `HINDSIGHT_API_MCP_AUTH_TOKEN` | Bearer token expected by Hindsight MCP. |
+| `HINDSIGHT_API_MCP_ENABLED_TOOLS` | Native read-only tool allowlist: `recall,list_memories,get_memory,list_tags,get_bank`. |
+| `HINDSIGHT_API_TENANT_EXTENSION` | Optional but recommended for API auth: `hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`. |
+| `HINDSIGHT_API_TENANT_API_KEY` | Admin/API key for maintainer CLI and API calls. |
+| `HINDSIGHT_API_DATABASE_URL` | Only needed if using external PostgreSQL instead of the chart-managed PostgreSQL. |
+| `HINDSIGHT_API_LLM_PROVIDER` / `HINDSIGHT_API_LLM_API_KEY` | Model provider configuration required by Hindsight retain/reflect processing. |
+
+Auth model:
+
+- Cody never receives a Hindsight token.
+- `cody-tools` receives only the MCP token and forwards it to Hindsight.
+- Maintainer/admin tooling receives the API/admin key outside Cody task pods.
+- If the Hindsight API key extension is enabled, maintainer CLI uses that key.
+- If Hindsight's MCP token and API key are different, keep them as separate
+  secrets.
+
 ### Kelos Repo: `cody-tools` Hindsight Proxy
 
 Add a restricted Hindsight MCP proxy to `cmd/cody-tools`.
@@ -429,7 +501,7 @@ Environment variables:
 | Env var | Purpose | Default |
 | --- | --- | --- |
 | `HINDSIGHT_MCP_URL` | Internal single-bank Hindsight MCP URL for `manually-created`. | empty means context disabled |
-| `HINDSIGHT_AUTHORIZATION` | Bearer token or equivalent read credential for `cody-tools`. | deployment-specific |
+| `HINDSIGHT_AUTHORIZATION` | Full `Authorization` header value for Hindsight MCP, normally `Bearer <token>`. | deployment-specific |
 | `HINDSIGHT_ALLOWED_TOOLS` | Comma-separated MCP tool allowlist. | `recall,list_memories,get_memory,list_tags,get_bank` |
 | `CODY_TOOLS_CONTEXT_TIMEOUT` | Per-request timeout to Hindsight. | `10s` |
 
@@ -437,7 +509,8 @@ Behavior:
 
 - If `HINDSIGHT_MCP_URL` is empty, `/mcp/context` should report context disabled.
 - Proxy only to the configured single-bank URL.
-- Expose only allowed read tools.
+- Expose only allowed read tools, even though Hindsight should already be
+  configured with the same native allowlist.
 - Preserve Hindsight tool names and schemas where possible.
 - Do not normalize Hindsight memories into a custom Cody schema in Phase 1.
 - Return a clear unavailable/error result if Hindsight is down.
@@ -456,10 +529,11 @@ Add runtime wiring in `k8s-platform-gitops`.
 
 Required resources:
 
-- Hindsight Deployment/Service or HelmRelease.
-- Hindsight backing store configuration.
-- Hindsight admin/write credential for maintainers only.
-- Hindsight read credential for `cody-tools`.
+- Hindsight HelmRepository/HelmRelease or direct OCI HelmRelease.
+- Hindsight values for namespace, API service, backing store, model provider,
+  MCP auth token, and native MCP tool allowlist.
+- Hindsight admin/API credential for maintainers only.
+- Hindsight MCP credential for `cody-tools`.
 - `HINDSIGHT_MCP_URL`, tool allowlist, and read credential wiring on
   `cody-tools`.
 - AgentConfig `cody-context`.
@@ -469,30 +543,61 @@ Recommended file additions:
 
 ```text
 k8s-platform-gitops/non-prod/kelos/
-  hindsight/
-    kustomization.yaml
-    deployment-or-release.yaml
-    service.yaml
-    external-secret.yaml
-    networkpolicy.yaml
+  helmrelease-hindsight.yaml
+  externalsecret-hindsight.yaml
+  networkpolicy-hindsight.yaml
   agentconfig-cody-context.yaml
 ```
+
+Recommended Hindsight Helm values:
+
+```yaml
+# `hindsight-secrets` is created by ExternalSecret and mounted into the API pod
+# via envFrom. It should contain HINDSIGHT_API_MCP_AUTH_TOKEN,
+# HINDSIGHT_API_TENANT_API_KEY, and HINDSIGHT_API_LLM_API_KEY.
+existingSecret: hindsight-secrets
+api:
+  env:
+    HINDSIGHT_API_MCP_ENABLED: "true"
+    HINDSIGHT_API_MCP_ENABLED_TOOLS: recall,list_memories,get_memory,list_tags,get_bank
+    HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+postgresql:
+  enabled: true
+ingress:
+  enabled: false
+controlPlane:
+  enabled: false
+```
+
+If chart-managed PostgreSQL is used, ensure `postgresql.auth.password` is
+provided through Flux secret-backed values, not as a literal committed value.
+If that wiring is awkward, use external/CNPG PostgreSQL for the first deployed
+version instead.
 
 Recommended `cody-tools` env:
 
 ```yaml
 - name: HINDSIGHT_MCP_URL
-  value: http://hindsight.kelos-system.svc.cluster.local:8080/mcp/manually-created/
+  value: http://hindsight-api.kelos-system.svc.cluster.local:8888/mcp/manually-created/
+- name: HINDSIGHT_AUTHORIZATION
+  valueFrom:
+    secretKeyRef:
+      name: cody-hindsight-mcp
+      key: Authorization
 - name: HINDSIGHT_ALLOWED_TOOLS
   value: recall,list_memories,get_memory,list_tags,get_bank
 ```
+
+Key Vault should store the bare MCP token if possible. The ExternalSecret can
+template the Kubernetes secret key as `Authorization: Bearer {{ .token }}` so
+callers never hand-compose the header in manifests.
 
 ## User Workflows
 
 ### Add A Manual Context Record To Hindsight
 
 1. Write the context body in a local Markdown file or directly in the CLI.
-2. Run the Hindsight CLI or internal `cody-memory` wrapper.
+2. Run the upstream Hindsight CLI or internal `cody-memory` wrapper.
 3. Provide required metadata: type, status, owner, scope, tags, and source refs.
 4. The CLI writes to the `manually-created` Hindsight bank.
 5. Cody can recall/read the record through `cody-tools` MCP.
@@ -570,14 +675,9 @@ GitOps repo:
 1. Add a record to Hindsight through the admin CLI:
 
 ```text
-cody-memory retain \
-  --bank manually-created \
-  --type glossary \
-  --status active \
-  --title "Cody Phase 1 context smoke test" \
-  --summary "This record proves Cody can read the manual context store." \
-  --owner shan \
-  --source human_note:smoke-test
+hindsight memory retain manually-created \
+  "Cody Phase 1 context smoke test: this record proves Cody can read the manual context store." \
+  --context "type=glossary status=active owner=shan source=human_note:smoke-test"
 ```
 
 2. Deploy.
@@ -600,6 +700,7 @@ Phase 1 is complete when:
 
 - A human can add a curated context record to Hindsight through an admin
   CLI/API path.
+- Hindsight direct MCP `tools/list` exposes only the Phase 1 read allowlist.
 - Cody can use Hindsight `recall` and `get_memory` through MCP.
 - Cody has no MCP write tools for context.
 - Cody's AgentConfig clearly says context is read-only and non-authoritative.
@@ -612,10 +713,13 @@ Phase 1 is complete when:
 
 ### Step 1: Hindsight Runtime
 
-- Deploy upstream Hindsight in non-prod.
-- Configure its backing store.
-- Create the `manually-created` bank.
-- Create separate admin/write and `cody-tools` read credentials.
+- Deploy upstream Hindsight in non-prod using the upstream OCI Helm chart.
+- Configure chart-managed PostgreSQL for the first spike, or external
+  PostgreSQL if platform owners prefer that from day one.
+- Configure `HINDSIGHT_API_MCP_ENABLED_TOOLS` to the Phase 1 read allowlist.
+- Configure `HINDSIGHT_API_MCP_AUTH_TOKEN` for MCP access.
+- Configure an admin/API key for maintainer CLI access.
+- Seed the `manually-created` bank through the upstream Hindsight CLI.
 - Add network policy so Cody task pods cannot call Hindsight directly.
 
 ### Step 2: Kelos / cody-tools
@@ -631,7 +735,8 @@ Phase 1 is complete when:
 ### Step 3: GitOps Wiring
 
 - Add Hindsight runtime resources.
-- Add Hindsight MCP URL, allowlist, and credential wiring to `cody-tools`.
+- Add Hindsight MCP URL, defense-in-depth allowlist, and credential wiring to
+  `cody-tools`.
 - Add `cody-context` AgentConfig.
 - Add `cody-context` to the alpha Cody TaskSpawner only.
 
@@ -689,22 +794,25 @@ This should not require rolling back the Atlassian MCP proxy.
 - Treating Hindsight as the canonical source for all organizational knowledge.
 - Forking Hindsight.
 
-## Open Decisions
+## Resolved Defaults And Open Decisions
 
-1. Whether to use the upstream Hindsight CLI directly or build a small
-   internal `cody-memory` wrapper.
-2. Which Hindsight backing store to use in non-prod.
-3. Whether `cody-context` should be an independent AgentConfig or merged into
-   the existing Cody tools AgentConfig.
-4. How to export/backup curated memories for audit and rollback.
+Resolved defaults:
 
-Recommended defaults:
-
-- Use a small internal `cody-memory` wrapper if upstream CLI validation is not
-  strict enough.
-- Deploy Hindsight in `kelos-system`.
+- Use upstream Hindsight for Phase 1; do not fork it.
+- Use the upstream Hindsight CLI for the first manual-write spike.
+- Deploy Hindsight in `kelos-system` with the upstream OCI Helm chart.
+- Use Hindsight single-bank MCP mode at `/mcp/manually-created/`.
+- Use Hindsight native MCP allowlisting plus `cody-tools` filtering.
 - Keep `cody-context` as a separate AgentConfig for modular rollout/rollback.
-- Export curated memories periodically once Phase 1 stabilizes.
+- Attach `cody-context` only to alpha Cody initially.
+
+Still open:
+
+1. Whether to keep chart-managed PostgreSQL beyond the first non-prod spike or
+   move to CNPG/external PostgreSQL immediately.
+2. Whether to add a small internal `cody-memory` wrapper after the CLI smoke
+   test, if upstream CLI validation is not strict enough.
+3. How to export/backup curated memories for audit and rollback.
 
 ## Appendix: Cognee Alternative
 
