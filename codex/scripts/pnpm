@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# pnpm wrapper: mints a fresh GitHub App installation token and exports it
+# as NODE_AUTH_TOKEN before exec'ing the real pnpm binary.
+#
+# Sits at /usr/local/bin/pnpm, which is ahead of /usr/bin/pnpm in PATH, so
+# any `pnpm` invocation (from the agent, from shells, from scripts) picks
+# up GitHub Packages auth for the @quantum-wealth scope without per-call
+# plumbing. pnpm reads .npmrc the same way npm does, so the line
+# `//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}` resolves against
+# the token the wrapper exports.
+#
+# Mirrors codex/scripts/npm exactly — pnpm doesn't shell out to npm, so
+# the npm wrapper does not cover pnpm invocations on its own.
+#
+# If NODE_AUTH_TOKEN is already set (operator override, CI injection,
+# or a previous wrapped npm call in the same shell), the wrapper does
+# nothing — the existing token wins and real pnpm sees it unchanged.
+#
+# Requires the GitHub App to have `packages: read` enabled on the
+# installation. Without that the minted token returns 403 against the
+# npm.pkg.github.com registry; the App's installation token endpoint
+# will still succeed, so the failure surfaces as `pnpm ERR_PNPM_FETCH_403`
+# on first private-package fetch, not at token mint time.
+set -euo pipefail
+
+if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_APP_CLIENT_ID:-}" ]]; then
+    NODE_AUTH_TOKEN=$(/usr/local/bin/github-app-token)
+    export NODE_AUTH_TOKEN
+  fi
+fi
+
+exec /usr/bin/pnpm "$@"

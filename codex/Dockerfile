@@ -131,16 +131,20 @@ RUN chmod +x /kelos_entrypoint.sh
 COPY codex/scripts/github-app-credential-helper /usr/local/bin/github-app-credential-helper
 COPY codex/scripts/github-app-token /usr/local/bin/github-app-token
 COPY codex/scripts/kelos-agent-setup /usr/local/bin/kelos-agent-setup
-# gh + npm wrappers sit at /usr/local/bin (ahead of /usr/bin in PATH) so
-# every `gh` invocation picks up an App installation token and every
-# `npm` invocation gets NODE_AUTH_TOKEN for the @quantum-wealth scope.
+# gh + npm + pnpm wrappers sit at /usr/local/bin (ahead of /usr/bin in
+# PATH) so every `gh` invocation picks up an App installation token and
+# every `npm`/`pnpm` invocation gets NODE_AUTH_TOKEN for the
+# @quantum-wealth scope. pnpm needs its own wrapper because it does not
+# shell out to npm — it reads .npmrc and the env directly.
 COPY codex/scripts/gh /usr/local/bin/gh
 COPY codex/scripts/npm /usr/local/bin/npm
+COPY codex/scripts/pnpm /usr/local/bin/pnpm
 RUN chmod +x /usr/local/bin/github-app-credential-helper \
     /usr/local/bin/github-app-token \
     /usr/local/bin/kelos-agent-setup \
     /usr/local/bin/gh \
-    /usr/local/bin/npm
+    /usr/local/bin/npm \
+    /usr/local/bin/pnpm
 
 # Alpheya engineering skills — baked at image build time into the
 # system-wide codex skills directory. Per https://developers.openai.com/codex/skills,
