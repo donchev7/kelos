@@ -28,13 +28,6 @@ spawner:
     requests: ""
     limits: ""
 controller:
-  env: []
-  agentOtel:
-    tracesExporter: ""
-    exporterOtlpEndpoint: ""
-    exporterOtlpTracesEndpoint: ""
-    propagators: ""
-    resourceAttributes: ""
   resources:
     requests: {}
     limits: {}
@@ -116,7 +109,6 @@ slackServer:
   secretName: ""
   # Message posted when the bot joins a channel. Leave empty to disable.
   joinMessage: ""
-  env: []
   resources:
     limits:
       cpu: 500m

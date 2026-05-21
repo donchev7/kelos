@@ -187,7 +187,7 @@ When building the Job:
   - `KELOS_TASK_NAME`
   - `KELOS_TASK_NAMESPACE`
   - `KELOS_TASKSPAWNER`
-  - `OTEL_SERVICE_NAME=cody-runtime` unless already set by pod overrides
+  - `OTEL_SERVICE_NAME=cody-runtime`
 - Add safe Datadog tags / labels only if they do not fight existing labels.
 
 Do not allow `podOverrides.env` to override `TRACEPARENT`, `TRACESTATE`, or
@@ -270,9 +270,9 @@ Target repo: `k8s-platform-gitops`.
 
 ### 1. Kelos Controller / Slack Server Env
 
-Add OTel environment for the Kelos HelmRelease values in
-`non-prod/kelos/helmrelease-patch.yaml` or the chart values path that maps to
-the controller and Slack server deployments.
+Add OTel environment without changing the Kelos Helm chart. Use Flux
+`spec.postRenderers.kustomize.patches` on the Kelos HelmRelease to add env vars
+to the rendered controller and Slack server Deployments.
 
 Desired values:
 
@@ -286,9 +286,8 @@ OTEL_RESOURCE_ATTRIBUTES: deployment.environment=non-prod,k8s.cluster.name=aks-c
 
 Slack server should use `OTEL_SERVICE_NAME=kelos-slack-server`.
 
-Exact chart key names need to be confirmed against the Kelos chart before
-implementation. If the chart does not expose per-component env cleanly, add
-chart support in Kelos first rather than using a brittle patch.
+This keeps observability rollout as a GitOps concern and avoids adding
+environment-specific OTel knobs to the reusable Helm chart.
 
 ### 2. Cody Agent Pod Env
 
@@ -296,8 +295,7 @@ For Cody TaskSpawners:
 
 - Do not hand-write `TRACEPARENT` / `TRACESTATE`; Kelos should inject these
   dynamically per Task.
-- Prefer centralized Kelos controller injection for agent exporter config
-  rather than repeating it in every TaskSpawner:
+- Configure agent exporter env in the relevant TaskSpawner `podOverrides.env`:
 
 ```yaml
 - name: OTEL_TRACES_EXPORTER
@@ -311,7 +309,8 @@ For Cody TaskSpawners:
 ```
 
 `OTEL_SERVICE_NAME` should be `cody-runtime` for the spawned agent pod. Prefer
-Kelos injection over repeating this in every TaskSpawner.
+Kelos injection for that service name so TaskSpawner authors cannot accidentally
+override it.
 
 ### 3. Pod Instrumentation Annotation
 

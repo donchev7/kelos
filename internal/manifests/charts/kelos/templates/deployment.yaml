@@ -73,25 +73,6 @@ spec:
             {{- if .Values.ghproxy.cacheTTL }}
             - --ghproxy-cache-ttl={{ .Values.ghproxy.cacheTTL }}
             {{- end }}
-            {{- if .Values.controller.agentOtel.tracesExporter }}
-            - --agent-otel-traces-exporter={{ .Values.controller.agentOtel.tracesExporter }}
-            {{- end }}
-            {{- if .Values.controller.agentOtel.exporterOtlpEndpoint }}
-            - --agent-otel-exporter-otlp-endpoint={{ .Values.controller.agentOtel.exporterOtlpEndpoint }}
-            {{- end }}
-            {{- if .Values.controller.agentOtel.exporterOtlpTracesEndpoint }}
-            - --agent-otel-exporter-otlp-traces-endpoint={{ .Values.controller.agentOtel.exporterOtlpTracesEndpoint }}
-            {{- end }}
-            {{- if .Values.controller.agentOtel.propagators }}
-            - --agent-otel-propagators={{ .Values.controller.agentOtel.propagators }}
-            {{- end }}
-            {{- if .Values.controller.agentOtel.resourceAttributes }}
-            - --agent-otel-resource-attributes={{ .Values.controller.agentOtel.resourceAttributes }}
-            {{- end }}
-          {{- if .Values.controller.env }}
-          env:
-            {{- toYaml .Values.controller.env | nindent 12 }}
-          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

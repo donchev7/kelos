@@ -5150,12 +5150,8 @@ func TestBuildJob_PodOverridesContainerSecurityContext(t *testing.T) {
 	}
 }
 
-func TestBuildJob_PropagatesTraceContextAndOTelEnv(t *testing.T) {
+func TestBuildJob_PropagatesTraceContextAndPodOverrideOTelEnv(t *testing.T) {
 	builder := NewJobBuilder()
-	builder.AgentOTelTracesExporter = "otlp"
-	builder.AgentOTelExporterOTLPEndpoint = "http://otel-collector:4318"
-	builder.AgentOTelPropagators = "tracecontext,baggage"
-	builder.AgentOTelResourceAttributes = "deployment.environment=test"
 
 	task := &kelosv1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5173,6 +5169,14 @@ func TestBuildJob_PropagatesTraceContextAndOTelEnv(t *testing.T) {
 		Spec: kelosv1alpha1.TaskSpec{
 			Type:   AgentTypeCodex,
 			Prompt: "Trace this",
+			PodOverrides: &kelosv1alpha1.PodOverrides{
+				Env: []corev1.EnvVar{
+					{Name: "OTEL_TRACES_EXPORTER", Value: "otlp"},
+					{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://otel-collector:4318"},
+					{Name: "OTEL_PROPAGATORS", Value: "tracecontext,baggage"},
+					{Name: "OTEL_RESOURCE_ATTRIBUTES", Value: "deployment.environment=test"},
+				},
+			},
 			Credentials: kelosv1alpha1.Credentials{
 				Type:      kelosv1alpha1.CredentialTypeOAuth,
 				SecretRef: &kelosv1alpha1.SecretReference{Name: "codex-auth"},

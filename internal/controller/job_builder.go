@@ -98,21 +98,16 @@ var reservedEnvNames = map[string]struct{}{
 
 // JobBuilder constructs Kubernetes Jobs for Tasks.
 type JobBuilder struct {
-	ClaudeCodeImage                     string
-	ClaudeCodeImagePullPolicy           corev1.PullPolicy
-	CodexImage                          string
-	CodexImagePullPolicy                corev1.PullPolicy
-	GeminiImage                         string
-	GeminiImagePullPolicy               corev1.PullPolicy
-	OpenCodeImage                       string
-	OpenCodeImagePullPolicy             corev1.PullPolicy
-	CursorImage                         string
-	CursorImagePullPolicy               corev1.PullPolicy
-	AgentOTelTracesExporter             string
-	AgentOTelExporterOTLPEndpoint       string
-	AgentOTelExporterOTLPTracesEndpoint string
-	AgentOTelPropagators                string
-	AgentOTelResourceAttributes         string
+	ClaudeCodeImage           string
+	ClaudeCodeImagePullPolicy corev1.PullPolicy
+	CodexImage                string
+	CodexImagePullPolicy      corev1.PullPolicy
+	GeminiImage               string
+	GeminiImagePullPolicy     corev1.PullPolicy
+	OpenCodeImage             string
+	OpenCodeImagePullPolicy   corev1.PullPolicy
+	CursorImage               string
+	CursorImagePullPolicy     corev1.PullPolicy
 }
 
 // NewJobBuilder creates a new JobBuilder.
@@ -150,31 +145,6 @@ func agentRuntimeServiceName(agentType string) string {
 		return "cody-runtime"
 	}
 	return "kelos-agent-runtime"
-}
-
-func (b *JobBuilder) agentOTelEnvVars() []corev1.EnvVar {
-	values := []struct {
-		name  string
-		value string
-	}{
-		{name: "OTEL_TRACES_EXPORTER", value: b.AgentOTelTracesExporter},
-		{name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: b.AgentOTelExporterOTLPEndpoint},
-		{name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", value: b.AgentOTelExporterOTLPTracesEndpoint},
-		{name: "OTEL_PROPAGATORS", value: b.AgentOTelPropagators},
-		{name: "OTEL_RESOURCE_ATTRIBUTES", value: b.AgentOTelResourceAttributes},
-	}
-
-	envVars := make([]corev1.EnvVar, 0, len(values))
-	for _, v := range values {
-		if v.value == "" {
-			continue
-		}
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  v.name,
-			Value: v.value,
-		})
-	}
-	return envVars
 }
 
 // apiKeyEnvVar returns the environment variable name used for API key
@@ -350,8 +320,6 @@ func (b *JobBuilder) buildAgentJob(task *kelosv1alpha1.Task, workspace *kelosv1a
 			})
 		}
 	}
-	envVars = append(envVars, b.agentOTelEnvVars()...)
-
 	if spawner := task.Labels["kelos.dev/taskspawner"]; spawner != "" {
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "KELOS_TASKSPAWNER",
