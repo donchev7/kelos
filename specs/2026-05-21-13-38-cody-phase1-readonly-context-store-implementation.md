@@ -127,6 +127,13 @@ Add a new MCP route to `cody-tools`:
 http://cody-tools.kelos-system.svc.cluster.local:8080/mcp/context
 ```
 
+For the Phase 1 alpha rollout, run that binary behind a separate
+`cody-tools-alpha` Service and point the alpha AgentConfig at:
+
+```text
+http://cody-tools-alpha.kelos-system.svc.cluster.local:8080/mcp/context
+```
+
 Add a dedicated Cody AgentConfig in `k8s-platform-gitops`:
 
 ```yaml
@@ -150,7 +157,7 @@ spec:
   mcpServers:
     - name: cody-context
       type: http
-      url: http://cody-tools.kelos-system.svc.cluster.local:8080/mcp/context
+      url: http://cody-tools-alpha.kelos-system.svc.cluster.local:8080/mcp/context
 ```
 
 Attach this AgentConfig only to the alpha Cody TaskSpawner for Phase 1. Normal
@@ -472,6 +479,7 @@ Recommended Hindsight env for Phase 1:
 | `HINDSIGHT_API_MCP_ENABLED` | Keep MCP enabled; default is already `true`. |
 | `HINDSIGHT_API_MCP_AUTH_TOKEN` | Bearer token expected by Hindsight MCP. |
 | `HINDSIGHT_API_MCP_ENABLED_TOOLS` | Native read-only tool allowlist: `recall,list_memories,get_memory,list_tags,get_bank`. |
+| `HINDSIGHT_API_MCP_STATELESS` | Prefer POST-only stateless MCP transport for the Cody proxy. |
 | `HINDSIGHT_API_TENANT_EXTENSION` | Optional but recommended for API auth: `hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`. |
 | `HINDSIGHT_API_TENANT_API_KEY` | Admin/API key for maintainer CLI and API calls. |
 | `HINDSIGHT_API_DATABASE_URL` | Only needed if using external PostgreSQL instead of the chart-managed PostgreSQL. |
@@ -490,11 +498,14 @@ Auth model:
 
 Add a restricted Hindsight MCP proxy to `cmd/cody-tools`.
 
-Recommended internal split:
+Recommended later internal split if the proxy grows:
 
 - `internal/mcpproxy`: generic HTTP MCP proxying and tool filtering.
 - `internal/hindsight`: Hindsight endpoint/auth config.
 - `cmd/cody-tools`: route `/mcp/context` to the restricted proxy.
+
+The initial implementation can stay in `cmd/cody-tools` to keep the Phase 1
+change small.
 
 Environment variables:
 
@@ -509,6 +520,8 @@ Behavior:
 
 - If `HINDSIGHT_MCP_URL` is empty, `/mcp/context` should report context disabled.
 - Proxy only to the configured single-bank URL.
+- Reject JSON-RPC batch requests and any explicit `bank_id` override so a Cody
+  task cannot bypass the Phase 1 single-bank boundary.
 - Expose only allowed read tools, even though Hindsight should already be
   configured with the same native allowlist.
 - Preserve Hindsight tool names and schemas where possible.
@@ -535,7 +548,9 @@ Required resources:
 - Hindsight admin/API credential for maintainers only.
 - Hindsight MCP credential for `cody-tools`.
 - `HINDSIGHT_MCP_URL`, tool allowlist, and read credential wiring on
-  `cody-tools`.
+  a separate `cody-tools-alpha` Deployment/Service, not the stable
+  `cody-tools` Deployment.
+- NetworkPolicy that lets only alpha Cody task pods reach `cody-tools-alpha`.
 - AgentConfig `cody-context`.
 - Add `cody-context` to the alpha Cody TaskSpawner `agentConfigRefs` only.
 
@@ -544,8 +559,12 @@ Recommended file additions:
 ```text
 k8s-platform-gitops/non-prod/kelos/
   helmrelease-hindsight.yaml
-  externalsecret-hindsight.yaml
+  external-secret-hindsight.yaml
+  external-secret-cody-hindsight-mcp.yaml
   networkpolicy-hindsight.yaml
+  deployment-cody-tools-alpha.yaml
+  service-cody-tools-alpha.yaml
+  networkpolicy-cody-tools-alpha.yaml
   agentconfig-cody-context.yaml
 ```
 
@@ -558,8 +577,10 @@ Recommended Hindsight Helm values:
 existingSecret: hindsight-secrets
 api:
   env:
+    HINDSIGHT_API_LLM_PROVIDER: openai
     HINDSIGHT_API_MCP_ENABLED: "true"
     HINDSIGHT_API_MCP_ENABLED_TOOLS: recall,list_memories,get_memory,list_tags,get_bank
+    HINDSIGHT_API_MCP_STATELESS: "true"
     HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
 postgresql:
   enabled: true
@@ -586,7 +607,12 @@ Recommended `cody-tools` env:
       key: Authorization
 - name: HINDSIGHT_ALLOWED_TOOLS
   value: recall,list_memories,get_memory,list_tags,get_bank
+- name: CODY_TOOLS_CONTEXT_TIMEOUT
+  value: 10s
 ```
+
+In the alpha rollout these env vars belong on `cody-tools-alpha`; stable
+`cody-tools` stays unchanged.
 
 Key Vault should store the bare MCP token if possible. The ExternalSecret can
 template the Kubernetes secret key as `Authorization: Bearer {{ .token }}` so
@@ -664,8 +690,9 @@ GitOps repo:
 
 - `kubectl kustomize non-prod/kelos` renders successfully.
 - Rendered Hindsight resources exist.
-- Rendered `cody-tools` Deployment includes Hindsight MCP URL, tool allowlist, and
-  read credential wiring.
+- Rendered `cody-tools-alpha` Deployment includes Hindsight MCP URL, tool
+  allowlist, and read credential wiring.
+- Rendered stable `cody-tools` Deployment does not include Hindsight env.
 - Rendered AgentConfig includes the `cody-context` MCP server.
 - Rendered alpha TaskSpawner includes `cody-context` in `agentConfigRefs`.
 - Rendered normal TaskSpawner does not include `cody-context`.
@@ -736,7 +763,7 @@ Phase 1 is complete when:
 
 - Add Hindsight runtime resources.
 - Add Hindsight MCP URL, defense-in-depth allowlist, and credential wiring to
-  `cody-tools`.
+  `cody-tools-alpha`.
 - Add `cody-context` AgentConfig.
 - Add `cody-context` to the alpha Cody TaskSpawner only.
 
@@ -764,7 +791,7 @@ Seed through the admin CLI/API path, not through Cody.
 Rollback should be simple:
 
 - Remove `cody-context` from the alpha TaskSpawner `agentConfigRefs`.
-- Remove or disable `HINDSIGHT_MCP_URL` on `cody-tools`.
+- Remove or disable `HINDSIGHT_MCP_URL` on `cody-tools-alpha`.
 - Leave Hindsight running if it is not causing issues; otherwise scale it down.
 - Keep the curated bank for later correction/export.
 

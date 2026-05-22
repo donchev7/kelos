@@ -71,6 +71,245 @@ func TestAtlassianHandlerRejectsUnknownSubroute(t *testing.T) {
 	}
 }
 
+func TestContextHandlerForwardsInitializeWithServerSideAuth(t *testing.T) {
+	var gotAuth string
+	var gotCookie string
+	var gotPath string
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotCookie = r.Header.Get("Cookie")
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      gotBody["id"],
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	req.Header.Set("Cookie", "session=client")
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if gotAuth != "Bearer hindsight-secret" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if gotCookie != "" {
+		t.Fatalf("Cookie forwarded = %q", gotCookie)
+	}
+	if gotPath != "/mcp/manually-created/" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotBody["method"] != "initialize" {
+		t.Fatalf("method = %q", gotBody["method"])
+	}
+}
+
+func TestContextHandlerForwardsInitializedNotification(t *testing.T) {
+	var gotMethod string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		gotMethod, _ = body["method"].(string)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if gotMethod != "notifications/initialized" {
+		t.Fatalf("method = %q", gotMethod)
+	}
+}
+
+func TestContextHandlerFiltersToolsListToReadAllowlist(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body["id"],
+			"result": map[string]any{
+				"tools": []any{
+					map[string]any{"name": "recall"},
+					map[string]any{"name": "get_memory"},
+					map[string]any{"name": "retain"},
+					map[string]any{"name": "delete_memory"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	names := toolNames(response["result"])
+	if strings.Join(names, ",") != "get_memory,recall" {
+		t.Fatalf("tools = %v", names)
+	}
+}
+
+func TestContextHandlerForwardsAllowedToolCall(t *testing.T) {
+	var gotTool string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		params, _ := body["params"].(map[string]any)
+		gotTool, _ = params["name"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body["id"],
+			"result":  map[string]any{"ok": true},
+		})
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"advisor portal"}}}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if gotTool != "recall" {
+		t.Fatalf("tool = %q", gotTool)
+	}
+}
+
+func TestContextHandlerRejectsDisallowedToolCall(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		t.Fatal("disallowed tool call should not reach upstream")
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"retain","arguments":{}}}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstreamHits = %d", upstreamHits)
+	}
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["error"] == nil {
+		t.Fatalf("expected MCP error, got %#v", response)
+	}
+}
+
+func TestContextHandlerRejectsBankOverride(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		t.Fatal("bank override should not reach upstream")
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recall","arguments":{"bank_id":"other","query":"advisor portal"}}}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstreamHits = %d", upstreamHits)
+	}
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["error"] == nil {
+		t.Fatalf("expected MCP error, got %#v", response)
+	}
+}
+
+func TestContextHandlerRejectsBatchRequests(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		t.Fatal("batch request should not reach upstream")
+	}))
+	defer upstream.Close()
+
+	s := newContextTestServer(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"retain","arguments":{}}}]`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstreamHits = %d", upstreamHits)
+	}
+}
+
+func TestContextHandlerReportsDisabledWhenUnconfigured(t *testing.T) {
+	s := &server{logger: testLogger(), httpClient: http.DefaultClient}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/context", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	rec := httptest.NewRecorder()
+
+	s.handleContext(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
 func TestAikidoHandlerProxiesReadOnlyRequestsWithServerSideAuth(t *testing.T) {
 	var gotAuth string
 	var gotCookie string
@@ -503,6 +742,24 @@ func mustJSON(t *testing.T, value any) string {
 		t.Fatalf("marshal: %v", err)
 	}
 	return string(data)
+}
+
+func newContextTestServer(upstream *httptest.Server) *server {
+	tools, err := parseAllowedTools("recall,get_memory")
+	if err != nil {
+		panic(err)
+	}
+	return &server{
+		cfg: config{
+			hindsightMCPURL: upstream.URL + "/mcp/manually-created/",
+			hindsightAuth:   "Bearer hindsight-secret",
+			hindsightTools:  tools,
+			contextTimeout:  defaultContextTimeout,
+		},
+		httpClient: upstream.Client(),
+		logger:     testLogger(),
+		ready:      true,
+	}
 }
 
 func testLogger() *slog.Logger {
