@@ -98,6 +98,11 @@ The stable and alpha TaskSpawners both run:
 - label `cody.alpheya.com/tools-client: "true"`
 - AgentConfigs composed with `cody-atlassian-mcp`
 
+Important naming detail: `cody-github-app` and `cody-webhook-github` are
+Kubernetes Secret names. The actual GitHub App currently wired through those
+Secrets is the existing `cursor` GitHub App, ID `3429269`; the Key Vault keys
+still use the `cursor-github-app-*` prefix.
+
 This is a strong debugger route but too broad for all future Cody jobs. Ticket
 creation and PR review do not need the same cluster Secret read scope or JWT
 claims as service debugging.

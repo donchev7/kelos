@@ -41,6 +41,11 @@ All Phase 1 persona TaskSpawners reuse the current Cody runtime shape:
 - current JWT signing env from `cody-jwt-signing`
 - `podOverrides.labels.cody.alpheya.com/tools-client: "true"`
 
+Important naming detail: `cody-github-app` and `cody-webhook-github` are
+Kubernetes Secret names. The actual GitHub App currently wired through those
+Secrets is the existing `cursor` GitHub App, ID `3429269`, using Key Vault keys
+named `cursor-github-app-*`.
+
 Persona-specific RBAC and narrower pod env are intentionally deferred.
 
 ## Behavioral Contract
@@ -514,8 +519,9 @@ spec:
 ```
 
 Use `cody-webhook-github` for Workspace auth because Kelos Workspace GitHub App
-auth expects Secret keys `appID`, `installationID`, and `privateKey`. The
-existing `cody-github-app` Secret is for the Cody agent helper scripts and uses
+auth expects Secret keys `appID`, `installationID`, and `privateKey`. That
+Secret points at the existing `cursor` GitHub App, ID `3429269`. The
+`cody-github-app` Secret is for the Cody agent helper scripts and uses
 different key names (`GITHUB_APP_CLIENT_ID`, `GITHUB_APP_INSTALLATION_ID`,
 `GITHUB_APP_PRIVATE_KEY`), so it is not the right Workspace secret.
 
