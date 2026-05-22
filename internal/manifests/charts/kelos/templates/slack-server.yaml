@@ -44,6 +44,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.slackServer.secretName }}
                   key: SLACK_APP_TOKEN
+            - name: SLACK_SELF_HANDOFF_ENABLED
+              value: {{ .Values.slackServer.selfHandoff.enabled | quote }}
+            - name: SLACK_SELF_HANDOFF_MAX_PER_THREAD
+              value: {{ .Values.slackServer.selfHandoff.maxPerThread | quote }}
             {{- if .Values.slackServer.joinMessage }}
             - name: SLACK_JOIN_MESSAGE_FILE
               value: /etc/kelos/join-message.txt

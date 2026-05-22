@@ -65,6 +65,17 @@ func formatAttachments(attachments []goslack.Attachment) string {
 // context. The caller decides whether to process the message — this function
 // always returns the thread body when the API call succeeds.
 func FetchThreadContext(ctx context.Context, api *goslack.Client, channelID, threadTS, botUserID string) (string, error) {
+	msgs, err := FetchThreadReplies(ctx, api, channelID, threadTS)
+	if err != nil {
+		return "", err
+	}
+
+	return FormatThreadContext(msgs, botUserID), nil
+}
+
+// FetchThreadReplies fetches the raw Slack thread history for callers that need
+// to inspect individual messages before formatting the agent prompt.
+func FetchThreadReplies(ctx context.Context, api *goslack.Client, channelID, threadTS string) ([]goslack.Message, error) {
 	threadCtx, cancel := context.WithTimeout(ctx, threadFetchTimeout)
 	defer cancel()
 
@@ -74,8 +85,8 @@ func FetchThreadContext(ctx context.Context, api *goslack.Client, channelID, thr
 			Timestamp: threadTS,
 		})
 	if err != nil {
-		return "", fmt.Errorf("fetching thread replies: %w", err)
+		return nil, fmt.Errorf("fetching thread replies: %w", err)
 	}
 
-	return FormatThreadContext(msgs, botUserID), nil
+	return msgs, nil
 }
