@@ -19,11 +19,13 @@ import (
 )
 
 const (
-	defaultAddr             = ":8080"
-	defaultUpstreamURL      = "https://mcp.atlassian.com/v1/mcp"
-	defaultSiteURL          = "https://wgen4.atlassian.net"
-	defaultAikidoAPIBaseURL = "https://app.aikido.dev/api/public/v1"
-	defaultAikidoTokenURL   = "https://app.aikido.dev/api/oauth/token"
+	defaultAddr                  = ":8080"
+	defaultUpstreamURL           = "https://mcp.atlassian.com/v1/mcp"
+	defaultSiteURL               = "https://wgen4.atlassian.net"
+	defaultAikidoAPIBaseURL      = "https://app.aikido.dev/api/public/v1"
+	defaultAikidoTokenURL        = "https://app.aikido.dev/api/oauth/token"
+	defaultHindsightAllowedTools = "recall,list_memories,get_memory,list_tags,get_bank"
+	defaultContextTimeout        = 10 * time.Second
 
 	envAddr                       = "CODY_TOOLS_ADDR"
 	envUpstreamURL                = "CODY_TOOLS_ATLASSIAN_UPSTREAM_URL"
@@ -36,9 +38,15 @@ const (
 	envAikidoClientCredentials    = "CODY_TOOLS_AIKIDO_CLIENT_CREDENTIALS"
 	envAikidoClientID             = "CODY_TOOLS_AIKIDO_CLIENT_ID"
 	envAikidoClientSecret         = "CODY_TOOLS_AIKIDO_CLIENT_SECRET"
+	envHindsightMCPURL            = "HINDSIGHT_MCP_URL"
+	envHindsightAuthorization     = "HINDSIGHT_AUTHORIZATION"
+	envHindsightAllowedTools      = "HINDSIGHT_ALLOWED_TOOLS"
+	envContextTimeout             = "CODY_TOOLS_CONTEXT_TIMEOUT"
 	aikidoRoute                   = "/aikido"
 	atlassianRoute                = "/mcp/atlassian"
+	contextRoute                  = "/mcp/context"
 	aikidoAuthorizationError      = "aikido credentials are not configured"
+	contextDisabledError          = "cody context is not configured"
 	aikidoDefaultTokenTTL         = 5 * time.Minute
 	aikidoTokenExpirySkew         = 1 * time.Minute
 	aikidoTokenRequestContentType = "application/x-www-form-urlencoded"
@@ -65,6 +73,10 @@ type config struct {
 	aikidoAuthorization string
 	aikidoClientID      string
 	aikidoClientSecret  string
+	hindsightMCPURL     string
+	hindsightAuth       string
+	hindsightTools      map[string]struct{}
+	contextTimeout      time.Duration
 }
 
 type server struct {
@@ -78,6 +90,13 @@ type server struct {
 type rpcRequestLogFields struct {
 	Method string
 	Tool   string
+}
+
+type mcpRequestInfo struct {
+	ID              any
+	Method          string
+	Tool            string
+	HasBankOverride bool
 }
 
 func main() {
@@ -114,8 +133,10 @@ func main() {
 	mux.HandleFunc(atlassianRoute+"/", s.handleAtlassian)
 	mux.HandleFunc(aikidoRoute, s.handleAikido)
 	mux.HandleFunc(aikidoRoute+"/", s.handleAikido)
+	mux.HandleFunc(contextRoute, s.handleContext)
+	mux.HandleFunc(contextRoute+"/", s.handleContext)
 
-	logger.Info("cody-tools listening", "addr", cfg.addr, "routes", []string{atlassianRoute, aikidoRoute})
+	logger.Info("cody-tools listening", "addr", cfg.addr, "routes", []string{atlassianRoute, aikidoRoute, contextRoute})
 	if err := http.ListenAndServe(cfg.addr, mux); err != nil {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
@@ -131,6 +152,9 @@ func loadConfig() (config, error) {
 		aikidoAPIBaseURL:    strings.TrimSpace(os.Getenv(envAikidoAPIBaseURL)),
 		aikidoTokenURL:      strings.TrimSpace(os.Getenv(envAikidoTokenURL)),
 		aikidoAuthorization: aikidoAuthorizationFromEnv(os.Getenv(envAikidoAuthorization), os.Getenv(envAikidoAPIKey)),
+		hindsightMCPURL:     strings.TrimSpace(os.Getenv(envHindsightMCPURL)),
+		hindsightAuth:       strings.TrimSpace(os.Getenv(envHindsightAuthorization)),
+		contextTimeout:      defaultContextTimeout,
 	}
 	clientID, clientSecret, err := aikidoClientCredentialsFromEnv(
 		os.Getenv(envAikidoClientCredentials),
@@ -139,6 +163,21 @@ func loadConfig() (config, error) {
 	)
 	if err != nil {
 		return config{}, err
+	}
+	tools, err := parseAllowedTools(os.Getenv(envHindsightAllowedTools))
+	if err != nil {
+		return config{}, err
+	}
+	cfg.hindsightTools = tools
+	if rawTimeout := strings.TrimSpace(os.Getenv(envContextTimeout)); rawTimeout != "" {
+		timeout, err := time.ParseDuration(rawTimeout)
+		if err != nil {
+			return config{}, fmt.Errorf("%s is invalid: %w", envContextTimeout, err)
+		}
+		if timeout <= 0 {
+			return config{}, fmt.Errorf("%s must be greater than zero", envContextTimeout)
+		}
+		cfg.contextTimeout = timeout
 	}
 	cfg.aikidoClientID = clientID
 	cfg.aikidoClientSecret = clientSecret
@@ -172,6 +211,14 @@ func loadConfig() (config, error) {
 	}
 	if err := validateURL(envAikidoTokenURL, cfg.aikidoTokenURL); err != nil {
 		return config{}, err
+	}
+	if cfg.hindsightMCPURL != "" {
+		if cfg.hindsightAuth == "" {
+			return config{}, fmt.Errorf("%s is required when %s is set", envHindsightAuthorization, envHindsightMCPURL)
+		}
+		if err := validateURL(envHindsightMCPURL, cfg.hindsightMCPURL); err != nil {
+			return config{}, err
+		}
 	}
 	return cfg, nil
 }
@@ -233,6 +280,24 @@ func isAuthorizationScheme(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseAllowedTools(raw string) (map[string]struct{}, error) {
+	if strings.TrimSpace(raw) == "" {
+		raw = defaultHindsightAllowedTools
+	}
+	allowed := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		tool := strings.TrimSpace(item)
+		if tool == "" {
+			continue
+		}
+		allowed[tool] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("%s must include at least one tool", envHindsightAllowedTools)
+	}
+	return allowed, nil
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -305,6 +370,39 @@ func (s *server) handleAikido(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("api_proxy_request", logArgs...)
 }
 
+func (s *server) handleContext(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != contextRoute && r.URL.Path != contextRoute+"/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, "read request body", http.StatusBadRequest)
+		return
+	}
+	fields := parseRPCRequestLogFields(body)
+	start := time.Now()
+
+	status, err := s.forwardContext(w, r, body)
+	duration := time.Since(start)
+	logArgs := []any{
+		"adapter", "context",
+		"route", contextRoute,
+		"method", fields.Method,
+		"tool", fields.Tool,
+		"http_method", r.Method,
+		"status", status,
+		"duration_ms", duration.Milliseconds(),
+	}
+	if err != nil {
+		logArgs = append(logArgs, "error", err)
+		s.logger.Error("mcp_request_failed", logArgs...)
+		return
+	}
+	s.logger.Info("mcp_request", logArgs...)
+}
+
 func (s *server) forwardAikido(w http.ResponseWriter, inbound *http.Request) (int, error) {
 	if inbound.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -353,6 +451,111 @@ func (s *server) forwardAikido(w http.ResponseWriter, inbound *http.Request) (in
 		return resp.StatusCode, err
 	}
 	return resp.StatusCode, nil
+}
+
+func (s *server) forwardContext(w http.ResponseWriter, inbound *http.Request, body []byte) (int, error) {
+	if s.cfg.hindsightMCPURL == "" {
+		http.Error(w, contextDisabledError, http.StatusServiceUnavailable)
+		return http.StatusServiceUnavailable, errors.New(contextDisabledError)
+	}
+	if inbound.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return http.StatusMethodNotAllowed, fmt.Errorf("method %s is not allowed", inbound.Method)
+	}
+
+	info, err := parseMCPRequestInfo(body)
+	if err != nil {
+		http.Error(w, "invalid MCP request", http.StatusBadRequest)
+		return http.StatusBadRequest, err
+	}
+	if info.Method == "tools/call" {
+		if info.Tool == "" {
+			writeMCPError(w, info.ID, -32602, "tools/call requires params.name")
+			return http.StatusOK, nil
+		}
+		if info.HasBankOverride {
+			writeMCPError(w, info.ID, -32602, "bank_id cannot be overridden in Cody context phase 1")
+			return http.StatusOK, nil
+		}
+		if !s.contextToolAllowed(info.Tool) {
+			writeMCPError(w, info.ID, -32601, fmt.Sprintf("tool %q is not available in Cody context phase 1", info.Tool))
+			return http.StatusOK, nil
+		}
+	}
+
+	reqCtx := inbound.Context()
+	if s.cfg.contextTimeout > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(reqCtx, s.cfg.contextTimeout)
+		defer cancel()
+	}
+	req, err := s.newHindsightRequest(reqCtx, inbound, body)
+	if err != nil {
+		http.Error(w, "build upstream request", http.StatusInternalServerError)
+		return http.StatusInternalServerError, err
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+		return http.StatusBadGateway, err
+	}
+	defer resp.Body.Close()
+
+	if info.Method == "tools/list" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		filtered, err := filterMCPToolsList(resp.Body, s.contextToolAllowed)
+		if err != nil {
+			http.Error(w, "filter tools list", http.StatusBadGateway)
+			return http.StatusBadGateway, err
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		if _, err := w.Write(filtered); err != nil {
+			return resp.StatusCode, err
+		}
+		return resp.StatusCode, nil
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return resp.StatusCode, err
+	}
+	return resp.StatusCode, nil
+}
+
+func (s *server) contextToolAllowed(name string) bool {
+	_, ok := s.cfg.hindsightTools[name]
+	return ok
+}
+
+func (s *server) newHindsightRequest(ctx context.Context, inbound *http.Request, body []byte) (*http.Request, error) {
+	upstreamURL, err := url.Parse(s.cfg.hindsightMCPURL)
+	if err != nil {
+		return nil, err
+	}
+	if inbound.URL.RawQuery != "" {
+		upstreamURL.RawQuery = inbound.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, inbound.Method, upstreamURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	copyRequestHeaders(req.Header, inbound.Header)
+	req.Header.Del("Authorization")
+	req.Header.Del("Cookie")
+	req.Header.Set("Authorization", s.cfg.hindsightAuth)
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json, text/event-stream")
+	}
+	if len(body) > 0 && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
 }
 
 func (s *server) aikidoAuthorization(ctx context.Context) (string, error) {
@@ -641,6 +844,76 @@ func parseRPCRequestLogFields(body []byte) rpcRequestLogFields {
 		}
 	}
 	return fields
+}
+
+func parseMCPRequestInfo(body []byte) (mcpRequestInfo, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return mcpRequestInfo{}, err
+	}
+	if _, ok := payload.([]any); ok {
+		return mcpRequestInfo{}, fmt.Errorf("JSON-RPC batch requests are not supported by %s", contextRoute)
+	}
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		return mcpRequestInfo{}, errors.New("JSON-RPC request must be an object")
+	}
+	info := mcpRequestInfo{ID: obj["id"]}
+	method, ok := obj["method"].(string)
+	if !ok || method == "" {
+		return mcpRequestInfo{}, errors.New("JSON-RPC method is required")
+	}
+	info.Method = method
+	params, _ := obj["params"].(map[string]any)
+	if method == "tools/call" && params != nil {
+		info.Tool, _ = params["name"].(string)
+		if _, ok := params["bank_id"]; ok {
+			info.HasBankOverride = true
+		}
+		if arguments, _ := params["arguments"].(map[string]any); arguments != nil {
+			if _, ok := arguments["bank_id"]; ok {
+				info.HasBankOverride = true
+			}
+		}
+	}
+	return info, nil
+}
+
+func writeMCPError(w http.ResponseWriter, id any, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func filterMCPToolsList(body io.Reader, allowed func(string) bool) ([]byte, error) {
+	var message map[string]any
+	if err := json.NewDecoder(body).Decode(&message); err != nil {
+		return nil, err
+	}
+	result, _ := message["result"].(map[string]any)
+	tools, _ := result["tools"].([]any)
+	filtered := make([]any, 0, len(tools))
+	for _, item := range tools {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := obj["name"].(string)
+		if allowed(name) {
+			filtered = append(filtered, item)
+		}
+	}
+	if result != nil {
+		result["tools"] = filtered
+	}
+	return json.Marshal(message)
 }
 
 func validateAtlassianAccess(ctx context.Context, client *http.Client, cfg config, logger *slog.Logger) error {
