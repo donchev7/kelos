@@ -1,12 +1,13 @@
 package capture
 
 import (
-	"os"
-	"path/filepath"
+	"bytes"
+	"errors"
+	"strings"
 	"testing"
 )
 
-func TestParseUsage(t *testing.T) {
+func TestStreamUsage(t *testing.T) {
 	tests := []struct {
 		name      string
 		agentType string
@@ -104,7 +105,7 @@ func TestParseUsage(t *testing.T) {
 			want:      nil,
 		},
 		{
-			name:      "empty file returns nil",
+			name:      "empty stream returns nil",
 			agentType: "claude-code",
 			content:   "",
 			want:      nil,
@@ -131,27 +132,95 @@ func TestParseUsage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := writeTempFile(t, tt.content)
-			got := ParseUsage(tt.agentType, path)
+			var out bytes.Buffer
+			got, err := StreamUsage(tt.agentType, strings.NewReader(tt.content), &out)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			assertMapEqual(t, tt.want, got)
+			// Every input line must be forwarded to stdout unchanged.
+			assertForwarded(t, tt.content, out.String())
 		})
 	}
 }
 
-func TestParseUsageMissingFile(t *testing.T) {
-	got := ParseUsage("claude-code", "/nonexistent/path/file.jsonl")
-	if got != nil {
-		t.Errorf("expected nil for missing file, got %v", got)
+// TestStreamUsageForwardsUnterminatedLine verifies that an input that does
+// not end with a newline still has its final line forwarded (terminated
+// with a newline, matching what `tee` produced previously).
+func TestStreamUsageForwardsUnterminatedLine(t *testing.T) {
+	in := `{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":2}}`
+	var out bytes.Buffer
+	got, err := StreamUsage("claude-code", strings.NewReader(in), &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got["cost-usd"] != "0.01" {
+		t.Errorf("cost-usd: want %q, got %q", "0.01", got["cost-usd"])
+	}
+	if out.String() != in+"\n" {
+		t.Errorf("forwarded output mismatch:\n  want: %q\n  got:  %q", in+"\n", out.String())
 	}
 }
 
-func writeTempFile(t *testing.T, content string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "agent-output.jsonl")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatal(err)
+// TestStreamUsageForwardsLargeLineByteForByte verifies that an
+// arbitrarily large single line is forwarded to w byte-for-byte and that
+// subsequent lines are still parsed for usage. The previous
+// bufio.Scanner-based implementation imposed a 10 MiB cap that either
+// dropped bytes or risked SIGPIPE in the agent producer once the line
+// exceeded the buffer; this test guards against any return of that
+// behaviour.
+func TestStreamUsageForwardsLargeLineByteForByte(t *testing.T) {
+	huge := strings.Repeat("a", 11*1024*1024)
+	tail := `{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":2}}`
+	in := huge + "\n" + tail + "\n"
+	var out bytes.Buffer
+	got, err := StreamUsage("claude-code", strings.NewReader(in), &out)
+	if err != nil {
+		t.Fatalf("unexpected error on large line: %v", err)
 	}
-	return path
+	if out.String() != in {
+		t.Errorf("forwarded output not byte-identical; got %d bytes, want %d", out.Len(), len(in))
+	}
+	if got["cost-usd"] != "0.01" {
+		t.Errorf("usage parsing skipped on line after large line: got %v", got)
+	}
+}
+
+// TestStreamUsagePropagatesFlushError verifies that a writer error
+// surfaced only at the final Flush is returned to the caller, not
+// silently swallowed.
+func TestStreamUsagePropagatesFlushError(t *testing.T) {
+	in := `{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":2}}` + "\n"
+	_, err := StreamUsage("claude-code", strings.NewReader(in), errWriter{})
+	if err == nil {
+		t.Fatalf("expected flush error, got nil")
+	}
+}
+
+// errWriter always fails. Used to force a Flush error from the buffered
+// writer inside StreamUsage.
+type errWriter struct{}
+
+func (errWriter) Write(p []byte) (int, error) {
+	return 0, errWriteFailed
+}
+
+var errWriteFailed = errors.New("write failed")
+
+// assertForwarded checks that the forwarded stream is byte-for-byte
+// identical to the input, with a trailing newline appended if the input
+// did not already end in one. This matches what `tee` produced and
+// catches reorderings, duplications, or dropped/extra lines that a mere
+// substring check would miss.
+func assertForwarded(t *testing.T, in, out string) {
+	t.Helper()
+	want := in
+	if want != "" && !strings.HasSuffix(want, "\n") {
+		want += "\n"
+	}
+	if out != want {
+		t.Errorf("forwarded output mismatch:\n  want: %q\n  got:  %q", want, out)
+	}
 }
 
 func assertMapEqual(t *testing.T, want, got map[string]string) {

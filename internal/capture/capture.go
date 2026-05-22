@@ -13,16 +13,23 @@ import (
 )
 
 const (
-	markerStart     = "---KELOS_OUTPUTS_START---"
-	markerEnd       = "---KELOS_OUTPUTS_END---"
-	agentOutputFile = "/tmp/agent-output.jsonl"
-	commandTimeout  = 30 * time.Second
+	markerStart    = "---KELOS_OUTPUTS_START---"
+	markerEnd      = "---KELOS_OUTPUTS_END---"
+	commandTimeout = 30 * time.Second
 )
 
-// Run captures deterministic outputs (branch, commit, PRs, token usage) from
-// the workspace and emits them between markers to stdout. Returns 0 on success.
+// Run streams the agent's JSON output from stdin to stdout, accumulating
+// per-agent token usage in memory, then emits deterministic outputs
+// (branch, commit, PRs, token usage) between markers on stdout. It is
+// intended to be the right-hand side of a pipe from the agent process so
+// that no on-disk copy of the stream is required.
 func Run() int {
-	outputs := captureOutputs(realRunner{}, agentOutputFile)
+	agentType := os.Getenv("KELOS_AGENT_TYPE")
+	usage, err := StreamUsage(agentType, os.Stdin, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kelos-capture: error reading agent output: %v\n", err)
+	}
+	outputs := captureOutputs(realRunner{}, usage)
 	if len(outputs) == 0 {
 		return 0
 	}
@@ -52,7 +59,7 @@ func (realRunner) run(name string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), err
 }
 
-func captureOutputs(r runner, usageFile string) []string {
+func captureOutputs(r runner, usage map[string]string) []string {
 	var outputs []string
 
 	inGitRepo := isGitRepo(r)
@@ -82,8 +89,6 @@ func captureOutputs(r runner, usageFile string) []string {
 		}
 	}
 
-	agentType := os.Getenv("KELOS_AGENT_TYPE")
-	usage := ParseUsage(agentType, usageFile)
 	for _, key := range []string{"cost-usd", "input-tokens", "output-tokens"} {
 		if v, ok := usage[key]; ok {
 			outputs = append(outputs, key+": "+v)
