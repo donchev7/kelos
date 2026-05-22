@@ -9,6 +9,7 @@ Scope:
 - Kelos code changes for result-driven Task handoffs.
 - Cody GitOps follow-up after the Kelos image and CRDs are released.
 - Slack persona handoffs only.
+- Explicit PR babysitting with a bounded dev/review loop.
 
 Out of scope:
 
@@ -25,6 +26,10 @@ This spec builds on:
 Phase 1 is assumed to be complete: Cody has explicit Slack persona entrypoints
 for `@cody !ticket`, `@cody !dev`, and `@cody !review`, while normal
 `@cody ...` debugger behavior remains unchanged.
+
+Phase 2 adds one new explicit Slack entrypoint:
+
+- `@cody !babysit <PR URL or PR context>`
 
 ## Summary
 
@@ -57,9 +62,13 @@ The intent is to support practical Cody flows such as:
   when implementation is requested.
 - `@cody !dev ALPM-123 ...` opens a PR, then hands off to PR review when a PR
   URL is emitted.
+- `@cody !babysit <PR>` starts a bounded PR babysitter loop: review the PR,
+  hand findings to dev for focused fixes, re-review, and stop when clean,
+  blocked, or max fix attempts are reached.
 
-Reviewer-to-dev auto-fix loops are not part of this phase. Reviewers may still
-tell the user to invoke `@cody !dev ...` manually.
+Automatic reviewer-to-dev fix loops only run inside the explicit babysitter
+route. One-shot `@cody !dev ...` and `@cody !review ...` remain one-pass routes
+unless a later GitOps change opts them into babysitting.
 
 ## Design Principles
 
@@ -75,6 +84,8 @@ tell the user to invoke `@cody !dev ...` manually.
   Kubernetes events, and parent/child task status.
 - Keep this narrower than a workflow engine. Phase 2 only creates child Tasks
   when a parent Task reaches a configured terminal phase and result predicate.
+- Keep automatic loops bounded by explicit loop metadata, max attempts, and
+  same-PR constraints.
 
 ## Current Kelos Behavior
 
@@ -103,11 +114,14 @@ The missing pieces are:
   triggers.
 - Do not let agents create arbitrary Kubernetes Tasks directly.
 - Do not add a generic DAG/workflow API.
-- Do not automatically create reviewer-to-dev remediation loops.
+- Do not automatically create reviewer-to-dev remediation loops outside the
+  explicit `@cody !babysit` route.
 - Do not change behavior for TaskSpawners that omit `spec.handoffs`.
 - Do not change the stable debugger route.
 - Do not split Cody service accounts in this phase.
 - Do not rely on channel-level Slack filtering.
+- Do not let the PR babysitter change unrelated PR scope or switch to a
+  different branch/PR mid-loop.
 
 ## Proposed API
 
@@ -154,6 +168,10 @@ type TaskHandoff struct {
     // Inherit controls metadata copied from the parent Task.
     // +optional
     Inherit TaskHandoffInherit `json:"inherit,omitempty"`
+
+    // Loop controls bounded handoff loops such as PR babysitting.
+    // +optional
+    Loop TaskHandoffLoop `json:"loop,omitempty"`
 
     // TaskTemplate is rendered and created as the child Task when this
     // handoff matches.
@@ -221,6 +239,36 @@ type TaskHandoffInherit struct {
     // +optional
     Lineage *bool `json:"lineage,omitempty"`
 }
+
+type TaskHandoffLoop struct {
+    // Name identifies the bounded loop this handoff participates in.
+    // Empty means this handoff is not part of a loop.
+    // +optional
+    // +kubebuilder:validation:MaxLength=40
+    // +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+    Name string `json:"name,omitempty"`
+
+    // MaxAttempts is the maximum number of fix attempts for this loop.
+    // For PR babysitting, this is the maximum number of reviewer-to-dev-fix
+    // handoffs, not the maximum number of total Tasks.
+    // +optional
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=5
+    MaxAttempts *int32 `json:"maxAttempts,omitempty"`
+
+    // IncrementAttempt increments the loop attempt counter on the child Task.
+    // For PR babysitting, set this on reviewer-to-dev-fix handoffs only.
+    // +optional
+    IncrementAttempt bool `json:"incrementAttempt,omitempty"`
+
+    // SubjectResultKey binds the loop to one external subject, such as pr.url.
+    // If set, the parent Task must have this result key and future loop
+    // handoffs must carry the same value.
+    // +optional
+    // +kubebuilder:validation:MaxLength=80
+    // +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`
+    SubjectResultKey string `json:"subjectResultKey,omitempty"`
+}
 ```
 
 ### Validation
@@ -236,6 +284,10 @@ CRD validation must enforce:
 - `Equals` and `NotEquals` must set `value` and must not set `values`.
 - `In` and `NotIn` must set at least one `values` entry and must not set
   `value`.
+- `handoffs[].loop.name`, when set, is DNS-label-safe.
+- `handoffs[].loop.maxAttempts`, when set, is between 1 and 5.
+- `handoffs[].loop.subjectResultKey`, when set, follows the result-key
+  pattern.
 - `handoffs` is optional and defaults to no behavior.
 
 The existing validation that requires `workspaceRef` for GitHub-backed source
@@ -388,6 +440,32 @@ kelos.dev/parent-task-uid: <parent task uid>
 kelos.dev/handoff: <handoff name>
 ```
 
+When `loop.name` is set on the handoff or inherited from the parent loop, also
+write:
+
+Labels:
+
+```yaml
+kelos.dev/loop-name: <loop name>
+kelos.dev/loop-attempt: "<attempt>"
+kelos.dev/loop-max-attempts: "<max attempts>"
+kelos.dev/loop-subject-key: <subject result key>
+kelos.dev/loop-subject-hash: <subject value hash>
+```
+
+Annotations:
+
+```yaml
+kelos.dev/loop-name: <loop name>
+kelos.dev/loop-attempt: "<attempt>"
+kelos.dev/loop-max-attempts: "<max attempts>"
+kelos.dev/loop-subject-key: <subject result key>
+kelos.dev/loop-subject: <subject value>
+```
+
+Only write `loop-subject-*` metadata when `loop.subjectResultKey` is set or
+the parent Task already has loop subject metadata.
+
 When `inherit.slackThread: true`, copy:
 
 Labels:
@@ -425,6 +503,12 @@ Reserved lineage keys cannot be overridden:
 - `kelos.dev/lineage-root`
 - `kelos.dev/lineage-depth`
 - `kelos.dev/parent-task-uid`
+- `kelos.dev/loop-name`
+- `kelos.dev/loop-attempt`
+- `kelos.dev/loop-max-attempts`
+- `kelos.dev/loop-subject-key`
+- `kelos.dev/loop-subject-hash`
+- `kelos.dev/loop-subject`
 
 ### Owner References
 
@@ -468,6 +552,12 @@ When rendering a handoff child `TaskTemplate`, add:
 .Lineage.Parent
 .Lineage.Depth
 .Handoff.Name
+.Loop.Name
+.Loop.Attempt
+.Loop.MaxAttempts
+.Loop.SubjectKey
+.Loop.Subject
+.Loop.SubjectHash
 ```
 
 Existing source-event template variables must continue to work unchanged for
@@ -481,11 +571,50 @@ PR: {{ index .Upstream.Results "pr" }}
 Reason: {{ index .Upstream.Results "handoff.reason" }}
 ```
 
+### Loop Semantics
+
+Loop support is only a bounded counter and metadata model. It does not turn
+Kelos into a workflow engine.
+
+For a handoff with `loop.name`:
+
+1. If the parent Task already has `kelos.dev/loop-name`, the child must keep the
+   same loop name unless the handoff explicitly starts a new loop from a
+   non-loop parent.
+2. The current attempt is read from parent label `kelos.dev/loop-attempt`.
+   Missing means `0`.
+3. The max attempts value is read from `handoff.loop.maxAttempts` when set;
+   otherwise from parent label `kelos.dev/loop-max-attempts`.
+4. If `handoff.loop.incrementAttempt=true`, the child attempt is parent attempt
+   plus 1.
+5. If `handoff.loop.incrementAttempt=false`, the child attempt is the parent
+   attempt.
+6. If incrementing would make the child attempt greater than max attempts,
+   block child creation and emit `HandoffBlocked`.
+7. If `loop.subjectResultKey` is set, read that key from
+   `parent.status.results`. Missing or empty subject values block child
+   creation.
+8. On the first loop handoff, write the subject key, subject value annotation,
+   and subject hash label to the child.
+9. On later loop handoffs, require the parent subject hash to match the hash of
+   the current subject value. A mismatch blocks child creation.
+
+For PR babysitting, only reviewer-to-dev-fix handoffs increment the attempt.
+Dev-fix-to-review handoffs keep the same attempt number.
+
+The babysitter prompts must also tell the reviewer to stop without emitting a
+handoff when the current attempt is already at max. The controller check is the
+safety net, not the primary user experience.
+
 ### Safety Checks
 
 The handoff reconciler must block:
 
-- lineage depth greater than 3
+- lineage depth greater than 8
+- loop attempt increments that would exceed `loop.maxAttempts`
+- loop handoffs that would switch `kelos.dev/loop-name` mid-loop
+- loop handoffs whose subject result is missing or differs from the existing
+  loop subject
 - a handoff whose target template would create a Task with the same handoff name
   and same AgentConfig stack as the parent, unless explicitly allowed in a
   future API
@@ -531,6 +660,17 @@ Expected user experience:
    reviewer child Task.
 6. Reviewer status and final response appear in the same thread.
 
+For `@cody !babysit <PR>`, the same Slack thread should contain the full
+babysitter sequence:
+
+1. Babysitter normalizes the PR URL/context and starts the loop.
+2. Reviewer checks the PR.
+3. If clean, the loop stops.
+4. If changes are requested and attempts remain, dev-fix runs on the same PR
+   branch.
+5. Reviewer checks the updated PR.
+6. The loop stops when clean, blocked, or max fix attempts are reached.
+
 Optional later polish: include `kelos.dev/handoff` or persona labels in Slack
 status blocks so users can visually distinguish parent and child personas. This
 is not required for Phase 2.
@@ -548,6 +688,8 @@ Persona AgentConfigs should instruct Cody to emit these result keys through
 | `handoff.reason` | Recommended | Short reason for audit and child prompt context. |
 | `handoff.prompt` | Recommended | Human-readable child prompt. Keep under 16 KiB. |
 | `handoff.prompt.base64` | Optional | Larger or multiline child prompt, base64 encoded. |
+| `pr.url` | Optional | PR URL supplied by the user or discovered by a babysitter. Use this when the built-in `pr` result is unavailable. |
+| `loop.status` | Optional | Loop state such as `continue`, `clean`, `blocked`, or `max-attempts`. |
 
 Prefer `handoff.prompt` when the prompt is one line or can be compact. Use
 `handoff.prompt.base64` when preserving multiline formatting matters.
@@ -580,9 +722,34 @@ Dev should not emit reviewer handoff when no PR was opened.
 | --- | --- |
 | `review.findings` | Optional compact summary count or category. |
 | `review.result` | Optional value such as `clean`, `changes-requested`, or `blocked`. |
+| `handoff.target=dev-fix` | Emit only inside the PR babysitter loop when changes are requested and another fix attempt is allowed. |
 
-Reviewer must not automatically hand off back to dev in Phase 2. It should tell
-the user how to invoke `@cody !dev ...` if follow-up implementation is needed.
+One-shot reviewer Tasks must not emit `handoff.target=dev-fix`. Only reviewer
+Tasks created inside the PR babysitter loop may emit that target. If a one-shot
+review finds issues, it should tell the user how to invoke `@cody !dev ...` or
+`@cody !babysit ...`.
+
+### PR babysitter outputs
+
+| Key | Purpose |
+| --- | --- |
+| `pr.url` | PR URL to babysit. |
+| `handoff.target=pr-reviewer` | Starts or continues review. |
+| `handoff.reason` | Short audit reason for the next child Task. |
+
+The babysitter persona should normalize the initial Slack request into a PR URL
+and start the first review handoff. It should not modify code directly.
+
+### Dev-fix outputs
+
+| Key | Purpose |
+| --- | --- |
+| `fix.pushed=true` | Dev successfully pushed a focused fix to the existing PR branch. |
+| `fix.result=blocked` | Dev could not safely apply the requested fix. |
+| `handoff.target=pr-reviewer` | Emit only after pushing fixes that should be re-reviewed. |
+
+Dev-fix mode is narrower than normal dev mode. It must only address reviewer
+findings for the existing PR and must not re-scope the original ticket.
 
 ## Cody GitOps Follow-Up
 
@@ -591,6 +758,215 @@ After Kelos Phase 2 is released, update the Cody Slack persona TaskSpawners in
 
 This GitOps follow-up is intentionally separate from the Kelos code PR because
 it depends on the new CRD and controller behavior being deployed.
+
+Required GitOps additions:
+
+- Add `agentconfig-cody-pr-babysitter.yaml`.
+- Add `taskspawner-cody-pr-babysitter-slack.yaml`.
+- Add `!babysit` to the stable debugger exclusion list so normal debugger
+  routing does not also answer babysitter requests.
+- Keep `mentionOptional` unset. Users must type `@cody !babysit ...`.
+
+### PR babysitter route
+
+Add a new Slack TaskSpawner for:
+
+```text
+@cody !babysit <PR URL or PR context>
+```
+
+The source Task should use `cody-pr-babysitter` and only normalize the request
+into structured outputs. It should not review or edit code directly.
+
+Recommended source Task behavior:
+
+```text
+pr.url: https://github.com/<org>/<repo>/pull/<number>
+handoff.target: pr-reviewer
+handoff.reason: User asked Cody to babysit this PR until clean, blocked, or max attempts are reached.
+```
+
+Configure the babysitter TaskSpawner with all three loop handoffs below.
+
+#### Babysitter to reviewer
+
+```yaml
+handoffs:
+  - name: babysit-to-review
+    terminalPhases:
+      - Succeeded
+    when:
+      results:
+        - key: handoff.target
+          operator: Equals
+          value: pr-reviewer
+        - key: pr.url
+          operator: Exists
+    inherit:
+      slackThread: true
+      dependsOnParent: true
+      lineage: true
+    loop:
+      name: pr-babysit
+      maxAttempts: 2
+      subjectResultKey: pr.url
+    taskTemplate:
+      type: codex
+      credentials:
+        type: oauth
+        secretRef:
+          name: cody-codex-credentials
+      image: docker.io/alpheya/codex:main
+      ttlSecondsAfterFinished: 3600
+      agentConfigRefs:
+        - name: cody-base
+        - name: cody-pr-reviewer
+        - name: cody-atlassian-mcp
+      metadata:
+        labels:
+          cody.alpheya.com/persona: pr-reviewer
+          cody.alpheya.com/source: slack-babysit-handoff
+      promptTemplate: |
+        Cody PR babysitter review pass.
+
+        Parent task: {{ .Upstream.Name }}
+        PR: {{ index .Upstream.Results "pr.url" }}
+        Loop: {{ .Loop.Name }}
+        Fix attempt: {{ .Loop.Attempt }} of {{ .Loop.MaxAttempts }}
+        Handoff reason: {{ index .Upstream.Results "handoff.reason" }}
+
+        Review this PR. If it is clean, emit review.result=clean and do not
+        emit a handoff target. If changes are required and fix attempts remain,
+        emit review.result=changes-requested and handoff.target=dev-fix with a
+        concise handoff.prompt describing the exact required fixes. When
+        emitting a handoff, also emit pr.url exactly as shown above. If blocked
+        or max attempts have been reached, emit review.result=blocked and do
+        not emit a handoff target.
+```
+
+#### Reviewer to dev-fix
+
+Add a second handoff entry to the same babysitter TaskSpawner:
+
+```yaml
+  - name: review-to-dev-fix
+    terminalPhases:
+      - Succeeded
+    when:
+      results:
+        - key: handoff.target
+          operator: Equals
+          value: dev-fix
+        - key: review.result
+          operator: Equals
+          value: changes-requested
+        - key: pr.url
+          operator: Exists
+    inherit:
+      slackThread: true
+      dependsOnParent: true
+      lineage: true
+    loop:
+      name: pr-babysit
+      maxAttempts: 2
+      incrementAttempt: true
+      subjectResultKey: pr.url
+    taskTemplate:
+      type: codex
+      credentials:
+        type: oauth
+        secretRef:
+          name: cody-codex-credentials
+      image: docker.io/alpheya/codex:main
+      ttlSecondsAfterFinished: 3600
+      agentConfigRefs:
+        - name: cody-base
+        - name: cody-dev
+        - name: cody-atlassian-mcp
+      metadata:
+        labels:
+          cody.alpheya.com/persona: dev
+          cody.alpheya.com/mode: pr-babysitter-fix
+          cody.alpheya.com/source: slack-babysit-handoff
+      promptTemplate: |
+        Cody PR babysitter fix pass.
+
+        Parent review task: {{ .Upstream.Name }}
+        PR: {{ index .Upstream.Results "pr.url" }}
+        Loop: {{ .Loop.Name }}
+        Fix attempt: {{ .Loop.Attempt }} of {{ .Loop.MaxAttempts }}
+        Review result: {{ index .Upstream.Results "review.result" }}
+        Review findings:
+        {{ index .Upstream.Results "handoff.prompt" }}
+
+        Apply only the requested fixes to the existing PR branch. Do not change
+        unrelated scope. Push the fix to the same PR branch. If fixes were
+        pushed, emit fix.pushed=true, pr.url exactly as shown above, and
+        handoff.target=pr-reviewer. If the fix cannot be applied safely, emit
+        fix.result=blocked and do not emit a handoff target.
+```
+
+#### Dev-fix to reviewer
+
+Add a third handoff entry to the same babysitter TaskSpawner:
+
+```yaml
+  - name: dev-fix-to-review
+    terminalPhases:
+      - Succeeded
+    when:
+      results:
+        - key: handoff.target
+          operator: Equals
+          value: pr-reviewer
+        - key: fix.pushed
+          operator: Equals
+          value: "true"
+        - key: pr.url
+          operator: Exists
+    inherit:
+      slackThread: true
+      dependsOnParent: true
+      lineage: true
+    loop:
+      name: pr-babysit
+      maxAttempts: 2
+      subjectResultKey: pr.url
+    taskTemplate:
+      type: codex
+      credentials:
+        type: oauth
+        secretRef:
+          name: cody-codex-credentials
+      image: docker.io/alpheya/codex:main
+      ttlSecondsAfterFinished: 3600
+      agentConfigRefs:
+        - name: cody-base
+        - name: cody-pr-reviewer
+        - name: cody-atlassian-mcp
+      metadata:
+        labels:
+          cody.alpheya.com/persona: pr-reviewer
+          cody.alpheya.com/source: slack-babysit-handoff
+      promptTemplate: |
+        Cody PR babysitter re-review pass.
+
+        Parent fix task: {{ .Upstream.Name }}
+        PR: {{ index .Upstream.Results "pr.url" }}
+        Loop: {{ .Loop.Name }}
+        Fix attempt: {{ .Loop.Attempt }} of {{ .Loop.MaxAttempts }}
+
+        Re-review the same PR after Cody dev pushed fixes. If clean, emit
+        review.result=clean and do not emit a handoff target. If changes are
+        still required and another fix attempt remains, emit
+        review.result=changes-requested and handoff.target=dev-fix with a
+        concise handoff.prompt. When emitting a handoff, also emit pr.url
+        exactly as shown above. If blocked or max attempts have been reached,
+        emit review.result=blocked and do not emit a handoff target.
+```
+
+Use the same runtime fields as the Phase 1 dev and reviewer TaskSpawners,
+including `podOverrides`, GitHub App env, JWT env, and service account.
 
 ### Ticket to dev handoff
 
@@ -697,6 +1073,16 @@ Use the same runtime fields as the Phase 1 reviewer TaskSpawner.
 
 ### AgentConfig updates
 
+Add `cody-pr-babysitter` instructions:
+
+- Parse the Slack request and identify the PR URL or exact PR context.
+- If no PR is identifiable, ask for a PR URL and do not emit handoff keys.
+- Emit `pr.url`.
+- Emit `handoff.target=pr-reviewer`.
+- Emit `handoff.reason`.
+- Do not review code directly.
+- Do not edit code directly.
+
 Update `cody-ticket-creator` instructions:
 
 - Use `kelos-output set ticket <KEY>` after creating or updating a Jira ticket.
@@ -716,11 +1102,32 @@ Update `cody-dev` instructions:
 
 Update `cody-pr-reviewer` instructions:
 
-- Do not emit `handoff.target=dev` in Phase 2.
-- If fixes are required, report findings and tell the user the exact
-  `@cody !dev ...` command to invoke.
+- In one-shot review mode, do not emit `handoff.target=dev-fix`.
+- In PR babysitter mode, emit `review.result=clean` and no handoff target when
+  the PR is clean.
+- In PR babysitter mode, emit `review.result=changes-requested`,
+  `handoff.target=dev-fix`, `pr.url`, and a concise `handoff.prompt` when
+  changes are needed and another fix attempt remains.
+- In PR babysitter mode, emit `review.result=blocked` and no handoff target
+  when blocked or when max attempts are reached.
+- If one-shot review finds issues, tell the user the exact `@cody !dev ...` or
+  `@cody !babysit ...` command to invoke.
 
-## Example End-to-End Flow
+Update `cody-dev` instructions for babysitter fix mode:
+
+- Detect `cody.alpheya.com/mode: pr-babysitter-fix` or the babysitter fix
+  prompt.
+- Only address reviewer findings for the existing PR.
+- Do not change unrelated scope.
+- Push to the existing PR branch only.
+- Emit `fix.pushed=true`, `pr.url`, and `handoff.target=pr-reviewer` after a
+  fix is pushed.
+- Emit `fix.result=blocked` and no handoff target when the fix cannot be
+  applied safely.
+
+## Example End-to-End Flows
+
+### Ticket to dev to review
 
 User message:
 
@@ -753,6 +1160,54 @@ Expected sequence:
 
 7. Handoff reconciler creates a PR reviewer child Task in the same Slack thread.
 8. Reviewer posts findings in the same Slack thread.
+
+### PR babysitter loop
+
+User message:
+
+```text
+@cody !babysit https://github.com/donchev7/kelos/pull/123
+```
+
+Expected sequence:
+
+1. `cody-pr-babysitter-slack` creates a babysitter Task.
+2. Babysitter emits:
+
+   ```text
+   pr.url: https://github.com/donchev7/kelos/pull/123
+   handoff.target: pr-reviewer
+   handoff.reason: User asked Cody to babysit this PR.
+   ```
+
+3. Handoff reconciler creates a reviewer child Task with
+   `kelos.dev/loop-name=pr-babysit`, `kelos.dev/loop-attempt=0`, and
+   `kelos.dev/loop-max-attempts=2`.
+4. If reviewer finds no issues, it emits `review.result=clean` and no handoff
+   target. The loop stops.
+5. If reviewer finds issues, it emits:
+
+   ```text
+   review.result: changes-requested
+   pr.url: https://github.com/donchev7/kelos/pull/123
+   handoff.target: dev-fix
+   handoff.prompt: Fix the missing assertion in the handoff controller test.
+   ```
+
+6. Handoff reconciler creates a dev-fix child Task with
+   `kelos.dev/loop-attempt=1`.
+7. Dev-fix pushes focused fixes and emits:
+
+   ```text
+   fix.pushed: true
+   pr.url: https://github.com/donchev7/kelos/pull/123
+   handoff.target: pr-reviewer
+   ```
+
+8. Handoff reconciler creates another reviewer child Task with the same attempt
+   number.
+9. The loop continues until clean, blocked, or the next reviewer-to-dev-fix
+   handoff would exceed max attempts.
 
 ## Implementation Plan
 
@@ -801,8 +1256,11 @@ Files to modify:
 Acceptance criteria:
 
 - `TaskSpawner.spec.handoffs` is optional.
+- `TaskSpawner.spec.handoffs[].loop` is optional.
 - Existing TaskSpawner YAML remains valid.
 - Validation rejects invalid operators and invalid result match shapes.
+- Validation rejects invalid loop names and invalid max attempts.
+- Validation rejects invalid loop subject result keys.
 - Generated CRDs include the new schema.
 
 ### 4. Implement handoff matching and child creation
@@ -824,6 +1282,11 @@ Acceptance criteria:
 - Child Task has lineage metadata.
 - Child Task depends on parent by default.
 - Child prompt template can read `.Upstream.Results`.
+- Child prompt template can read `.Loop` values for loop handoffs.
+- Loop attempts increment only on handoffs with
+  `loop.incrementAttempt=true`.
+- Loop handoffs are blocked when the next attempt would exceed max attempts.
+- Loop handoffs are blocked when the subject changes mid-loop.
 - `maxConcurrency`, `maxTotalTasks`, and `suspend` block child creation.
 - Handoff blocked/created/failed events are emitted.
 
@@ -864,7 +1327,11 @@ After the Kelos PR merges:
 - Capture rejects reserved extra output keys.
 - Result matcher covers `Exists`, `Equals`, `NotEquals`, `In`, and `NotIn`.
 - Handoff child naming is deterministic and at most 63 characters.
-- Handoff template vars include `.Upstream`, `.Lineage`, and `.Handoff`.
+- Handoff template vars include `.Upstream`, `.Lineage`, `.Handoff`, and
+  `.Loop`.
+- Loop attempt calculation covers start, increment, carry-forward, and
+  max-attempt blocking.
+- Loop subject binding hashes and compares stable subject values.
 
 ### Controller tests
 
@@ -882,7 +1349,12 @@ After the Kelos PR merges:
 - `suspend=true` blocks child creation.
 - `maxConcurrency` blocks child creation.
 - `maxTotalTasks` blocks child creation.
-- lineage depth greater than 3 blocks child creation.
+- lineage depth greater than 8 blocks child creation.
+- PR babysitter reviewer-to-dev-fix increments loop attempt.
+- PR babysitter dev-fix-to-review keeps the same loop attempt.
+- PR babysitter max attempts blocks the next dev-fix child.
+- PR babysitter loop metadata is copied through reviewer and dev-fix children.
+- PR babysitter subject mismatch blocks child creation.
 
 ### Manual Slack tests after GitOps rollout
 
@@ -937,6 +1409,23 @@ Expected:
 - reviewer persona runs independently
 - no automatic dev handoff occurs
 
+Babysit PR:
+
+```text
+@cody !babysit https://github.com/donchev7/kelos/pull/<test-pr>
+```
+
+Expected:
+
+- babysitter persona normalizes the PR and starts review
+- reviewer child appears in the same Slack thread
+- if reviewer emits `review.result=changes-requested` and
+  `handoff.target=dev-fix`, dev-fix child appears in the same thread
+- dev-fix pushes only focused fixes to the existing PR branch
+- re-review child appears after `fix.pushed=true`
+- loop stops when clean, blocked, or max attempts are reached
+- no more than the configured max number of dev-fix attempts occurs
+
 Negative routing:
 
 ```text
@@ -958,6 +1447,16 @@ Expected:
 
 - no Cody Task is created
 
+Unmentioned babysitter prefix:
+
+```text
+!babysit https://github.com/donchev7/kelos/pull/<test-pr>
+```
+
+Expected:
+
+- no Cody Task is created
+
 ## Rollback
 
 Kelos code rollback:
@@ -970,6 +1469,8 @@ Kelos code rollback:
 GitOps rollback:
 
 - Remove `handoffs` entries from Cody TaskSpawners.
+- Remove `cody-pr-babysitter-slack` if the babysitter route itself is causing
+  issues.
 - Keep Phase 1 persona routes intact.
 - Flux should converge without deleting existing completed Tasks until their
   TTL expires.
@@ -997,10 +1498,14 @@ Operational kill switches:
 Phase 2 is complete when:
 
 - Kelos supports optional `TaskSpawner.spec.handoffs`.
+- Kelos supports optional bounded loop metadata for handoff chains.
 - Agents can emit safe custom result keys through `kelos-output`.
 - Capture publishes those keys into `Task.status.results`.
 - Matching handoff rules create exactly one child Task.
+- Loop handoffs enforce max attempts and cannot run forever.
 - Child Tasks report in the same Slack thread when configured.
 - Cody GitOps can configure ticket-to-dev and dev-to-review handoffs without
   adding GitHub triggers or a router persona.
+- Cody GitOps can configure `@cody !babysit` to run a bounded review/dev-fix
+  loop on one PR.
 - Existing Cody behavior remains unchanged for routes without handoffs.
