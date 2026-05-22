@@ -168,7 +168,7 @@ func TestAikidoHandlerMintsAndCachesOAuthToken(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"access_token": "token-1",
-			"token_type":   "Bearer",
+			"token_type":   "bearer",
 			"expires_in":   3600,
 		})
 	}))
