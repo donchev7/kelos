@@ -449,7 +449,7 @@ func (c *aikidoOAuthClientCredentials) invalidate() {
 
 func (c *aikidoOAuthClientCredentials) authorizationHeader() string {
 	tokenType := strings.TrimSpace(c.tokenType)
-	if tokenType == "" {
+	if tokenType == "" || strings.EqualFold(tokenType, "bearer") {
 		tokenType = "Bearer"
 	}
 	return tokenType + " " + c.token
