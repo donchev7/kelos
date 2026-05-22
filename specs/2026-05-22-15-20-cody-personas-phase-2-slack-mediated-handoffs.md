@@ -120,7 +120,7 @@ Findings:
 - The export query still includes closed accounts when multiple filters are combined.
 
 Next step:
-@cody !dev please fix the review findings above on the same PR. Babysit fix attempt 1 of 2.
+@cody !dev please fix the review findings above on the same PR.
 ```
 
 ### Dev fix to re-review inside babysitting
@@ -133,7 +133,7 @@ Changes:
 - Fixed combined-filter closed-account handling.
 
 Next step:
-@cody !review please re-review the PR above. Babysit fix attempt 1 of 2.
+@cody !review please re-review the PR above.
 ```
 
 ### Clean or blocked terminal states
@@ -211,13 +211,13 @@ Add a flag:
 
 ```text
 SLACK_SELF_HANDOFF_ENABLED=false
-SLACK_SELF_HANDOFF_MAX_PER_THREAD=6
+SLACK_SELF_HANDOFF_MAX_PER_THREAD=4
 ```
 
 Defaults:
 
 - `SLACK_SELF_HANDOFF_ENABLED=false`
-- `SLACK_SELF_HANDOFF_MAX_PER_THREAD=6`
+- `SLACK_SELF_HANDOFF_MAX_PER_THREAD=4`
 
 The feature must be off by default so the image can ship before GitOps opts in.
 
@@ -235,6 +235,8 @@ Accept the message only when:
 - the command target is one of `ticket`, `dev`, `review`, or `babysit`
 - the thread has fewer than `SLACK_SELF_HANDOFF_MAX_PER_THREAD` prior
   Cody-authored handoff command lines
+- the normalized command line is not the same as the most recent prior
+  Cody-authored handoff command line in the thread
 
 If accepted:
 
@@ -251,6 +253,17 @@ If rejected:
 - Log the reason.
 - Do not post another Slack message for normal rejections. The original Cody
   message remains visible and a human can manually continue if needed.
+
+If rejected because the per-thread cap was reached:
+
+- Do not create a Task.
+- Post at most one short stop notice in the thread:
+
+  ```text
+  Auto-handoff stopped after 4 Cody handoffs in this thread. Please continue manually if needed.
+  ```
+
+The stop notice must not contain a standalone `@cody !...` command line.
 
 ### TaskSpawner matching
 
@@ -339,7 +352,7 @@ Dev fix mode inside babysitting:
 
 ```text
 Next step:
-@cody !review please re-review the PR above. Babysit fix attempt <n> of <max>.
+@cody !review please re-review the PR above.
 ```
 
 ### PR reviewer
@@ -355,15 +368,15 @@ Babysitter review mode:
 
 - if clean, report clean and stop
 - if blocked, report why and stop
-- if changes are required and attempts remain:
+- if changes are required:
 
 ```text
 Next step:
-@cody !dev please fix the review findings above on the same PR. Babysit fix attempt <next> of <max>.
+@cody !dev please fix the review findings above on the same PR.
 ```
 
-The reviewer decides whether attempts remain from the visible thread context.
-The Kelos safety cap is only a generic backstop.
+Kelos stops runaway review/fix loops with the per-thread self-handoff cap. The
+personas do not need to track numeric attempts in Slack.
 
 ### PR babysitter
 
@@ -373,12 +386,12 @@ The babysitter persona does not review or edit code directly. It normalizes the
 request and starts the first review:
 
 ```text
-I will babysit this PR for up to 2 Cody fix attempts.
+I will babysit this PR and stop when the PR is clean, blocked, or the thread's auto-handoff limit is reached.
 
 PR: https://github.com/donchev7/kelos/pull/123
 
 Next step:
-@cody !review please review the PR above. This is babysit review pass 0 of 2.
+@cody !review please review the PR above as part of babysitting.
 ```
 
 ## GitOps Changes
@@ -426,7 +439,7 @@ Set:
 
 ```text
 SLACK_SELF_HANDOFF_ENABLED=true
-SLACK_SELF_HANDOFF_MAX_PER_THREAD=6
+SLACK_SELF_HANDOFF_MAX_PER_THREAD=4
 ```
 
 No new Slack app, signing secret, internal TaskSpawner, or handoff CRD is
@@ -470,7 +483,7 @@ required.
 2. Babysitter posts a normal response plus:
 
    ```text
-   @cody !review please review the PR above. This is babysit review pass 0 of 2.
+   @cody !review please review the PR above as part of babysitting.
    ```
 
 3. Reviewer reviews.
@@ -478,18 +491,17 @@ required.
 5. If changes are needed, reviewer posts:
 
    ```text
-   @cody !dev please fix the review findings above on the same PR. Babysit fix attempt 1 of 2.
+   @cody !dev please fix the review findings above on the same PR.
    ```
 
 6. Dev fixes and posts:
 
    ```text
-   @cody !review please re-review the PR above. Babysit fix attempt 1 of 2.
+   @cody !review please re-review the PR above.
    ```
 
-7. Loop continues until clean, blocked, or the persona decides the max attempt
-   has been reached. The Kelos per-thread cap prevents runaway chains if the
-   prompt logic fails.
+7. Loop continues until clean or blocked. If the personas keep handing off, the
+   Kelos per-thread cap stops the chain.
 
 ## Unhappy Paths And Fallbacks
 
@@ -500,9 +512,10 @@ required.
 | Cody puts a command example in a code block | Ignored by self-handoff detection. |
 | Cody's message is not a thread reply | Ignored by self-handoff detection. |
 | Cody's bot ID is not configured in `allowedBotIDs` | The self-handoff line is detected but no persona route accepts it. Human can send the line manually. |
+| Cody repeats the same handoff command twice in a row | Kelos ignores the repeated self-handoff. Human can continue manually if needed. |
 | Persona TaskSpawner is at max concurrency | Existing Slack handler drops the event. The visible command line remains in Slack for manual retry. |
 | Slack event delivery misses Cody's reply | The visible command line remains in Slack for manual retry. |
-| Babysitter loop goes wrong | Per-thread self-handoff cap stops runaway chains. Human can continue manually if needed. |
+| Babysitter loop goes wrong | Per-thread self-handoff cap stops runaway chains after 4 Cody handoffs. Human can continue manually if needed. |
 | Reviewer says blocked | No next-command line is included, so the loop stops. |
 
 The main fallback is intentionally human: because the handoff is just a normal
@@ -513,8 +526,8 @@ Slack command, anyone can reply with the same command line later.
 - This is less deterministic than Kelos-native handoffs.
 - Loop state is conversational, not controller-enforced.
 - Same-PR discipline is prompt-enforced, not Kubernetes-enforced.
-- Max attempts rely on persona instructions, with only a generic per-thread cap
-  as backup.
+- There is no detailed loop-state model. The only automatic loop stop is the
+  generic per-thread self-handoff cap.
 - There is no parent/child Task relationship beyond Slack thread context.
 - Slack delivery is part of the workflow.
 
@@ -552,11 +565,27 @@ Acceptance criteria:
 
 - self-handoff routing counts prior Cody-authored handoff command lines in the
   thread
-- default cap is 6
+- default cap is 4
 - cap can be configured with `SLACK_SELF_HANDOFF_MAX_PER_THREAD`
 - cap rejection creates no Task and logs a clear reason
+- cap rejection posts at most one short stop notice in the thread
 
-### 3. GitOps
+### 3. Add duplicate consecutive command guard
+
+Files:
+
+- `internal/slack/handler.go`
+- `internal/slack/thread.go`
+
+Acceptance criteria:
+
+- self-handoff routing compares the current normalized command line to the most
+  recent prior Cody-authored handoff command line in the thread
+- if the command line is identical, create no Task
+- duplicate rejection logs a clear reason
+- duplicate rejection does not post a Slack stop notice by default
+
+### 4. GitOps
 
 Files in `k8s-platform-gitops/non-prod/kelos`:
 
@@ -567,7 +596,7 @@ Files in `k8s-platform-gitops/non-prod/kelos`:
   self-handoffs
 - set `SLACK_SELF_HANDOFF_ENABLED=true`
 
-### 4. AgentConfig updates
+### 5. AgentConfig updates
 
 Update the persona prompts so each persona knows when to include one
 next-command line and when to stop.
@@ -583,6 +612,7 @@ Unit tests:
 - ignore messages with multiple handoff lines
 - normalize literal `@cody` to the bot mention token
 - enforce per-thread self-handoff cap
+- ignore duplicate consecutive normalized command lines
 
 Slack handler tests:
 
@@ -635,6 +665,19 @@ Have Cody post two standalone `@cody !...` lines in a test thread.
 
 Expected: no self-handoff Task is created.
 
+Cap guard:
+
+Have Cody post a fifth standalone handoff line in a thread with 4 prior
+Cody-authored handoff lines.
+
+Expected: no self-handoff Task is created and one stop notice is posted.
+
+Duplicate guard:
+
+Have Cody repeat the same standalone handoff line twice in a row.
+
+Expected: the second line does not create another Task.
+
 ## Rollback
 
 Fast rollback:
@@ -660,6 +703,9 @@ This shortcut is complete when:
 - Kelos can optionally auto-route Cody's own handoff line to the next persona.
 - No hidden Slack payload, signature, or internal `!handoff` command is needed.
 - `@cody !babysit` exists and can run a bounded conversational review/fix loop.
+- Cody self-handoff loops stop after 4 auto-handoffs in one Slack thread by
+  default.
+- Cody repeated consecutive handoff commands do not create duplicate Tasks.
 - Existing human-triggered Phase 1 behavior is unchanged.
 - Disabling `SLACK_SELF_HANDOFF_ENABLED` returns the system to manual handoff
   suggestions only.
