@@ -125,6 +125,41 @@ func TestRender_DisableTelemetry(t *testing.T) {
 	}
 }
 
+func TestRender_UsageCollector(t *testing.T) {
+	vals := map[string]interface{}{
+		"image": map[string]interface{}{
+			"tag": "v0.0.0-test",
+		},
+		"usageCollector": map[string]interface{}{
+			"enabled":            true,
+			"databaseSecretName": "cody-usage-postgres",
+			"databaseURLKey":     "DATABASE_URL",
+			"clusterName":        "non-prod",
+			"instanceName":       "cody",
+			"namespace":          "kelos-system",
+		},
+	}
+	data, err := Render(manifests.ChartFS, vals)
+	if err != nil {
+		t.Fatalf("rendering chart: %v", err)
+	}
+	output := string(data)
+	for _, expected := range []string{
+		"name: kelos-usage-collector",
+		"image: ghcr.io/kelos-dev/kelos-usage-collector:v0.0.0-test",
+		"- run",
+		"- --namespace=kelos-system",
+		"name: DATABASE_URL",
+		"name: cody-usage-postgres",
+		"name: kelos-usage-collector-role",
+		"resources:\n      - tasks\n      - taskspawners\n      - agentsessions\n      - agentturns",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected rendered output to contain %q", expected)
+		}
+	}
+}
+
 func TestRender_ResourceOrdering(t *testing.T) {
 	data, err := Render(manifests.ChartFS, nil)
 	if err != nil {
@@ -185,8 +220,8 @@ func TestRender_TaskSpawnerTemplatePlaceholdersRemainLiteral(t *testing.T) {
 		"GitHub pull request sources additionally expose: {{.Branch}}, {{.ReviewState}}, {{.ReviewComments}}",
 		"Cron sources: {{.Time}}, {{.Schedule}}",
 	} {
-		if count := strings.Count(output, expected); count != 2 {
-			t.Errorf("expected %q to appear twice in TaskSpawner CRD descriptions, got %d", expected, count)
+		if count := strings.Count(output, expected); count != 4 {
+			t.Errorf("expected %q to appear four times in TaskSpawner and AgentSession CRD descriptions, got %d", expected, count)
 		}
 	}
 }

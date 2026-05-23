@@ -119,3 +119,21 @@ slackServer:
     requests:
       cpu: 10m
       memory: 64Mi
+
+usageCollector:
+  enabled: false
+  image: ghcr.io/kelos-dev/kelos-usage-collector
+  replicas: 1
+  databaseSecretName: ""
+  databaseURLKey: DATABASE_URL
+  clusterName: ""
+  instanceName: cody
+  namespace: ""
+  migrate: true
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 20m
+      memory: 64Mi

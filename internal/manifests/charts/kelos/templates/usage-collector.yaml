@@ -1,0 +1,90 @@
+{{- if .Values.usageCollector.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kelos-usage-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: usage-collector
+spec:
+  replicas: {{ .Values.usageCollector.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kelos
+      app.kubernetes.io/component: usage-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kelos
+        app.kubernetes.io/component: usage-collector
+    spec:
+      serviceAccountName: kelos-usage-collector
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: usage-collector
+          image: {{ .Values.usageCollector.image }}{{- if .Values.image.tag }}:{{ .Values.image.tag }}{{- end }}
+          {{- if .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- end }}
+          args:
+            - run
+            - --leader-elect
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --migrate={{ .Values.usageCollector.migrate }}
+            {{- if .Values.usageCollector.namespace }}
+            - --namespace={{ .Values.usageCollector.namespace }}
+            {{- end }}
+            {{- if .Values.usageCollector.clusterName }}
+            - --cluster={{ .Values.usageCollector.clusterName }}
+            {{- end }}
+            {{- if .Values.usageCollector.instanceName }}
+            - --instance={{ .Values.usageCollector.instanceName }}
+            {{- end }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "usageCollector.databaseSecretName is required when usageCollector.enabled=true" .Values.usageCollector.databaseSecretName }}
+                  key: {{ .Values.usageCollector.databaseURLKey }}
+            {{- if .Values.usageCollector.clusterName }}
+            - name: KELOS_USAGE_CLUSTER
+              value: {{ .Values.usageCollector.clusterName | quote }}
+            {{- end }}
+            - name: KELOS_USAGE_INSTANCE
+              value: {{ .Values.usageCollector.instanceName | quote }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- if .Values.usageCollector.resources }}
+          resources:
+            {{- toYaml .Values.usageCollector.resources | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - "ALL"
+{{- end }}

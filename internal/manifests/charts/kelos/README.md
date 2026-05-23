@@ -203,6 +203,30 @@ When enabled, the webhook servers expose the following endpoints:
 
 See `examples/helm-values-webhook.yaml` for a complete example configuration.
 
+## Usage Collector Configuration
+
+The chart includes an optional read-only usage collector for Cody dashboards. It
+watches `Task`, `AgentSession`, and `AgentTurn` resources and writes aggregate
+metadata to PostgreSQL. It does not store prompts, Slack message text, thread
+transcripts, or agent response bodies.
+
+```yaml
+usageCollector:
+  enabled: true
+  databaseSecretName: cody-usage-postgres
+  databaseURLKey: DATABASE_URL
+  clusterName: non-prod
+  instanceName: cody
+  namespace: kelos-system
+  migrate: true
+```
+
+The referenced Secret must contain `DATABASE_URL`, for example:
+
+```text
+postgres://cody_usage:<password>@cody-usage-pg-rw.kelos-system.svc.cluster.local:5432/cody_usage?sslmode=disable
+```
+
 ### Gateway API (Alternative to Ingress)
 
 Kelos webhook servers can be exposed via the Kubernetes Gateway API instead of an Ingress. See `examples/gateway-api-webhook.md` for prerequisites, configuration, and a provider comparison (Istio, Envoy Gateway, Kong, Nginx Gateway Fabric). The companion values file is `examples/webhook-gateway-values.yaml`.
