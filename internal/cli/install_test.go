@@ -483,11 +483,13 @@ func TestInstallCommand_DryRunIncludesEachCRDOnce(t *testing.T) {
 		crdNames[obj.GetName()]++
 	}
 
-	if crdCount != 4 {
-		t.Fatalf("expected 4 CRDs in dry-run output, got %d", crdCount)
+	if crdCount != 6 {
+		t.Fatalf("expected 6 CRDs in dry-run output, got %d", crdCount)
 	}
 	for _, name := range []string{
 		"agentconfigs.kelos.dev",
+		"agentsessions.kelos.dev",
+		"agentturns.kelos.dev",
 		"tasks.kelos.dev",
 		"taskspawners.kelos.dev",
 		"workspaces.kelos.dev",
