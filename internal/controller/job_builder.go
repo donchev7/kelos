@@ -161,6 +161,12 @@ func (b *JobBuilder) BuildSessionRunner(session *kelosv1alpha1.AgentSession, wor
 	c := &job.Spec.Template.Spec.Containers[0]
 	c.Command = []string{"/kelos-session-runner"}
 	c.Args = nil
+	if c.SecurityContext == nil {
+		c.SecurityContext = &corev1.SecurityContext{}
+	}
+	if c.SecurityContext.AllowPrivilegeEscalation == nil {
+		c.SecurityContext.AllowPrivilegeEscalation = ptr(false)
+	}
 	c.Env = append(c.Env,
 		corev1.EnvVar{Name: "KELOS_AGENT_SESSION_NAME", Value: session.Name},
 		corev1.EnvVar{Name: "KELOS_AGENT_SESSION_NAMESPACE", Value: session.Namespace},

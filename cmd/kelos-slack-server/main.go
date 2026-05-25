@@ -267,13 +267,16 @@ func runSlackReportingCycle(ctx context.Context, cl client.Client, taskReporter 
 	if err := cl.List(ctx, &turnList, client.MatchingLabels{reporting.LabelSlackReporting: "enabled"}); err != nil {
 		return fmt.Errorf("Listing AgentTurns for Slack reporting: %w", err)
 	}
+	activeTurnUIDs := make(map[types.UID]bool, len(turnList.Items))
 	for i := range turnList.Items {
 		turn := &turnList.Items[i]
+		activeTurnUIDs[turn.UID] = true
 		if err := turnReporter.ReportTurnStatus(ctx, turn); err != nil {
 			log.Error(err, "Failed to report AgentTurn status",
 				"turn", turn.Name, "namespace", turn.Namespace)
 		}
 	}
+	turnReporter.SweepActivityCache(activeTurnUIDs)
 
 	return nil
 }
