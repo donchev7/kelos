@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -18,6 +20,9 @@ import (
 type SlackTurnReporter struct {
 	Client   client.Client
 	Reporter SlackMessenger
+
+	mu           sync.Mutex
+	lastActivity map[types.UID]string
 }
 
 // ReportTurnStatus posts the accepted and terminal Slack messages for an
@@ -42,7 +47,7 @@ func (tr *SlackTurnReporter) ReportTurnStatus(ctx context.Context, turn *kelosv1
 		return nil
 	}
 	if !terminal && turn.Status.SlackProgressMessageTS != "" {
-		return nil
+		return tr.reportRunningActivity(ctx, turn, channel)
 	}
 	if terminal && turn.Status.SlackAgentMessageTS != "" {
 		return nil
@@ -85,6 +90,36 @@ func (tr *SlackTurnReporter) reportAcceptedTurn(ctx context.Context, turn *kelos
 	})
 }
 
+func (tr *SlackTurnReporter) reportRunningActivity(ctx context.Context, turn *kelosv1alpha1.AgentTurn, channel string) error {
+	activity := turn.Status.Activity
+	if activity == "" {
+		return nil
+	}
+	tr.mu.Lock()
+	if tr.lastActivity == nil {
+		tr.lastActivity = make(map[types.UID]string)
+	}
+	if tr.lastActivity[turn.UID] == activity {
+		tr.mu.Unlock()
+		return nil
+	}
+	tr.lastActivity[turn.UID] = activity
+	tr.mu.Unlock()
+
+	msgs := FormatSlackTransitionMessage("accepted", turn.Name, turn.Status.Message, nil)
+	msg := appendActivityContext(msgs[0], activity)
+	if len(msg.Blocks) == 0 {
+		return nil
+	}
+	log := ctrl.Log.WithName("slack-turn-reporter")
+	log.Info("Updating Slack accepted reply with AgentTurn activity", "turn", turn.Name, "channel", channel)
+	if err := tr.Reporter.UpdateMessage(ctx, channel, turn.Status.SlackProgressMessageTS, msg); err != nil {
+		log.V(1).Info("Failed to update AgentTurn activity", "turn", turn.Name, "error", err)
+		tr.clearActivity(turn.UID)
+	}
+	return nil
+}
+
 func (tr *SlackTurnReporter) reportTerminalTurn(ctx context.Context, turn *kelosv1alpha1.AgentTurn, channel, threadTS string, msgs []SlackMessage) error {
 	log := ctrl.Log.WithName("slack-turn-reporter")
 
@@ -117,6 +152,7 @@ func (tr *SlackTurnReporter) reportTerminalTurn(ctx context.Context, turn *kelos
 	}); err != nil {
 		return err
 	}
+	tr.clearActivity(turn.UID)
 
 	if turn.Spec.SessionRef.Name != "" {
 		if err := tr.patchSessionStatus(ctx, turn.Namespace, turn.Spec.SessionRef.Name, func(s *kelosv1alpha1.AgentSession) {
@@ -127,6 +163,22 @@ func (tr *SlackTurnReporter) reportTerminalTurn(ctx context.Context, turn *kelos
 	}
 
 	return nil
+}
+
+func (tr *SlackTurnReporter) clearActivity(uid types.UID) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	delete(tr.lastActivity, uid)
+}
+
+func (tr *SlackTurnReporter) SweepActivityCache(activeUIDs map[types.UID]bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for uid := range tr.lastActivity {
+		if !activeUIDs[uid] {
+			delete(tr.lastActivity, uid)
+		}
+	}
 }
 
 func (tr *SlackTurnReporter) patchTurnStatus(ctx context.Context, namespace, name string, mutate func(*kelosv1alpha1.AgentTurn)) error {

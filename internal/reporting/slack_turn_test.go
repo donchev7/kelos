@@ -120,3 +120,55 @@ func TestSlackTurnReporter_UpdatesAcceptedMessageAndSessionTimestamp(t *testing.
 		t.Fatalf("LastAgentMessageTS = %q, want progress-ts", updatedSession.Status.LastAgentMessageTS)
 	}
 }
+
+func TestSlackTurnReporter_UpdatesRunningActivity(t *testing.T) {
+	turn := &kelosv1alpha1.AgentTurn{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "session-t-0001",
+			Namespace: "kelos-system",
+			UID:       "turn-uid",
+			Annotations: map[string]string{
+				AnnotationSlackReporting: "enabled",
+				AnnotationSlackChannel:   "C123",
+				AnnotationSlackThreadTS:  "1710000000.000001",
+			},
+		},
+		Spec: kelosv1alpha1.AgentTurnSpec{
+			SessionRef: kelosv1alpha1.AgentSessionReference{Name: "session"},
+		},
+		Status: kelosv1alpha1.AgentTurnStatus{
+			Phase:                  kelosv1alpha1.AgentTurnPhaseRunning,
+			SlackProgressMessageTS: "progress-ts",
+			Activity:               "Running command: gh pr checks",
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithStatusSubresource(&kelosv1alpha1.AgentTurn{}).
+		WithObjects(turn).
+		Build()
+	updateCount := 0
+	reporter := &fakeSlackReporter{
+		updateFn: func(ctx context.Context, channel, messageTS string, msg SlackMessage) error {
+			updateCount++
+			if channel != "C123" || messageTS != "progress-ts" {
+				t.Fatalf("unexpected Slack update target channel=%s messageTS=%s", channel, messageTS)
+			}
+			if msg.Text == "" || len(msg.Blocks) == 0 {
+				t.Fatal("expected rich Slack activity message")
+			}
+			return nil
+		},
+	}
+
+	tr := &SlackTurnReporter{Client: cl, Reporter: reporter}
+	if err := tr.ReportTurnStatus(context.Background(), turn); err != nil {
+		t.Fatalf("ReportTurnStatus() error = %v", err)
+	}
+	if err := tr.ReportTurnStatus(context.Background(), turn); err != nil {
+		t.Fatalf("ReportTurnStatus() second call error = %v", err)
+	}
+	if updateCount != 1 {
+		t.Fatalf("updateCount = %d, want one deduped activity update", updateCount)
+	}
+}

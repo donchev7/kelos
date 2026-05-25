@@ -1,0 +1,121 @@
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+)
+
+func TestWaitForTurn_AppServerErrorWaitsForFailedTurnCompleted(t *testing.T) {
+	turn, cl := newTestTurnClient(t)
+	app := &appServerClient{
+		events: make(chan rpcMessage, 2),
+	}
+	app.events <- rpcMessage{Method: "error", Params: rawJSON(`{"error":{"message":"Reconnecting... 2/5"}}`)}
+	app.events <- rpcMessage{Method: "turn/completed", Params: rawJSON(`{"turn":{"status":"failed"}}`)}
+
+	_, err := waitForTurn(context.Background(), app, "session", "turn-1", cl, turn)
+	if err == nil {
+		t.Fatal("waitForTurn() error = nil, want stored app-server error")
+	}
+	if !strings.Contains(err.Error(), "Reconnecting... 2/5") {
+		t.Fatalf("waitForTurn() error = %q, want stored app-server error", err.Error())
+	}
+}
+
+func TestWaitForTurn_AppServerErrorOnCloseUsesStoredMessage(t *testing.T) {
+	turn, cl := newTestTurnClient(t)
+	app := &appServerClient{
+		events: make(chan rpcMessage, 2),
+	}
+	app.events <- rpcMessage{Method: "error", Params: rawJSON(`{"error":{"message":"upstream disconnected"}}`)}
+	close(app.events)
+
+	_, err := waitForTurn(context.Background(), app, "session", "turn-1", cl, turn)
+	if err == nil {
+		t.Fatal("waitForTurn() error = nil, want app-server exit error")
+	}
+	if !strings.Contains(err.Error(), "upstream disconnected") {
+		t.Fatalf("waitForTurn() error = %q, want stored app-server error", err.Error())
+	}
+}
+
+func TestWaitForTurn_ThreadStatusActivityDoesNotFailTurn(t *testing.T) {
+	turn, cl := newTestTurnClient(t)
+	app := &appServerClient{
+		events: make(chan rpcMessage, 2),
+	}
+	app.events <- rpcMessage{Method: "thread/status/changed", Params: rawJSON(`{"status":"active"}`)}
+	app.events <- rpcMessage{Method: "turn/completed", Params: rawJSON(`{"turn":{"status":"completed","finalMessage":"done"}}`)}
+
+	got, err := waitForTurn(context.Background(), app, "session", "turn-1", cl, turn)
+	if err != nil {
+		t.Fatalf("waitForTurn() error = %v", err)
+	}
+	if got != "done" {
+		t.Fatalf("waitForTurn() = %q, want done", got)
+	}
+	var updated kelosv1alpha1.AgentTurn
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(turn), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Activity != "Codex session status: active" {
+		t.Fatalf("Activity = %q, want thread status activity", updated.Status.Activity)
+	}
+}
+
+func TestClassifyAppServerDiagnostic_StdinClosed(t *testing.T) {
+	diag, ok := classifyAppServerDiagnostic("write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true")
+	if !ok {
+		t.Fatal("classifyAppServerDiagnostic() ok = false, want true")
+	}
+	if diag.Kind != "interactive_tool_without_pty" {
+		t.Fatalf("Kind = %q, want interactive_tool_without_pty", diag.Kind)
+	}
+	if !strings.Contains(diag.Activity, "tty=true") {
+		t.Fatalf("Activity = %q, want tty guidance", diag.Activity)
+	}
+}
+
+func TestRenderTurnPrompt_IncludesTTYGuidance(t *testing.T) {
+	session := &kelosv1alpha1.AgentSession{
+		ObjectMeta: metav1.ObjectMeta{Name: "session", Namespace: "kelos-system"},
+	}
+	turn := &kelosv1alpha1.AgentTurn{
+		Spec: kelosv1alpha1.AgentTurnSpec{
+			Input: kelosv1alpha1.AgentTurnInput{Body: "help"},
+			Source: kelosv1alpha1.AgentTurnSource{
+				UserID:    "U123",
+				MessageTS: "1.2",
+			},
+		},
+	}
+	got := renderTurnPrompt(session, turn)
+	if !strings.Contains(got, "start the command with a TTY") {
+		t.Fatalf("renderTurnPrompt() did not include TTY guidance:\n%s", got)
+	}
+}
+
+func newTestTurnClient(t *testing.T) (*kelosv1alpha1.AgentTurn, client.Client) {
+	t.Helper()
+	turn := &kelosv1alpha1.AgentTurn{
+		ObjectMeta: metav1.ObjectMeta{Name: "turn", Namespace: "kelos-system"},
+		Status:     kelosv1alpha1.AgentTurnStatus{Phase: kelosv1alpha1.AgentTurnPhaseRunning},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithStatusSubresource(&kelosv1alpha1.AgentTurn{}).
+		WithObjects(turn).
+		Build()
+	return turn, cl
+}
+
+func rawJSON(s string) []byte {
+	return []byte(s)
+}

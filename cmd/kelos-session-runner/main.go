@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,10 +33,12 @@ import (
 
 const (
 	pollInterval      = 5 * time.Second
+	turnTimeout       = 4 * time.Hour
 	appServerCommand  = "codex"
 	sessionLabel      = "kelos.dev/agent-session"
 	runnerClientName  = "kelos_session_runner"
 	runnerClientTitle = "Kelos Session Runner"
+	maxActivityRunes  = 180
 )
 
 type rpcMessage struct {
@@ -52,12 +56,30 @@ type rpcError struct {
 }
 
 type appServerClient struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	encoderMu sync.Mutex
-	nextID    atomic.Int64
-	responses chan rpcMessage
-	events    chan rpcMessage
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	encoderMu   sync.Mutex
+	nextID      atomic.Int64
+	responses   chan rpcMessage
+	events      chan rpcMessage
+	diagnostics chan appServerDiagnostic
+}
+
+type appServerDiagnostic struct {
+	Kind     string
+	Message  string
+	Activity string
+}
+
+type turnInterruptedError struct {
+	message string
+}
+
+func (e turnInterruptedError) Error() string {
+	if e.message != "" {
+		return e.message
+	}
+	return "Codex turn interrupted"
 }
 
 func main() {
@@ -284,17 +306,22 @@ func startAppServer(ctx context.Context) (*appServerClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	c := &appServerClient{
-		cmd:       cmd,
-		stdin:     stdin,
-		responses: make(chan rpcMessage, 32),
-		events:    make(chan rpcMessage, 256),
+		cmd:         cmd,
+		stdin:       stdin,
+		responses:   make(chan rpcMessage, 32),
+		events:      make(chan rpcMessage, 256),
+		diagnostics: make(chan appServerDiagnostic, 64),
 	}
 	go c.readLoop(stdout)
+	go c.stderrLoop(stderr)
 	return c, nil
 }
 
@@ -318,6 +345,31 @@ func (c *appServerClient) readLoop(r io.Reader) {
 	}
 	close(c.responses)
 	close(c.events)
+}
+
+func (c *appServerClient) stderrLoop(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		_, _ = fmt.Fprintln(os.Stderr, line)
+		if diag, ok := classifyAppServerDiagnostic(line); ok {
+			select {
+			case c.diagnostics <- diag:
+			default:
+			}
+		}
+	}
+}
+
+func (c *appServerClient) drainDiagnostics() {
+	for {
+		select {
+		case <-c.diagnostics:
+		default:
+			return
+		}
+	}
 }
 
 func (c *appServerClient) stop() {
@@ -515,6 +567,7 @@ func runTurn(ctx context.Context, cl client.Client, app *appServerClient, sessio
 	if err != nil {
 		return failTurn(ctx, cl, session, turn, err.Error())
 	}
+	app.drainDiagnostics()
 	codexTurnID := extractString(result, "turn", "id")
 	if codexTurnID != "" {
 		if err := patchTurnStatus(ctx, cl, turn.Namespace, turn.Name, func(t *kelosv1alpha1.AgentTurn) {
@@ -523,8 +576,14 @@ func runTurn(ctx context.Context, cl client.Client, app *appServerClient, sessio
 			return err
 		}
 	}
-	finalText, err := waitForTurn(ctx, app, codexTurnID, cl, turn)
+	turnCtx, cancel := context.WithTimeout(ctx, turnTimeout)
+	defer cancel()
+	finalText, err := waitForTurn(turnCtx, app, session.Name, codexTurnID, cl, turn)
 	if err != nil {
+		var interrupted turnInterruptedError
+		if errors.As(err, &interrupted) {
+			return cancelTurn(ctx, cl, session, turn, interrupted.Error())
+		}
 		return failTurn(ctx, cl, session, turn, err.Error())
 	}
 	completed := metav1.Now()
@@ -545,17 +604,61 @@ func runTurn(ctx context.Context, cl client.Client, app *appServerClient, sessio
 	})
 }
 
-func waitForTurn(ctx context.Context, app *appServerClient, codexTurnID string, cl client.Client, turn *kelosv1alpha1.AgentTurn) (string, error) {
+func waitForTurn(ctx context.Context, app *appServerClient, sessionName, codexTurnID string, cl client.Client, turn *kelosv1alpha1.AgentTurn) (string, error) {
 	var final strings.Builder
+	var lastAppServerError string
+	summary := newAppServerTurnSummary()
+	log := ctrl.Log.WithName("session-runner").WithValues(
+		"agent_session", sessionName,
+		"agent_turn", turn.Name,
+		"namespace", turn.Namespace,
+		"codex_turn_id", codexTurnID,
+	)
+	defer summary.log(log)
 	for {
 		select {
 		case <-ctx.Done():
+			if lastAppServerError != "" {
+				return "", fmt.Errorf("%w: last app-server error: %s", ctx.Err(), lastAppServerError)
+			}
 			return "", ctx.Err()
+		case diag := <-app.diagnostics:
+			if diag.Kind == "" {
+				continue
+			}
+			log.Info("codex_app_server_diagnostic",
+				"diagnostic_kind", diag.Kind,
+				"message", sanitizeForLog(diag.Message),
+			)
+			if diag.Activity != "" {
+				_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, diag.Activity)
+			}
 		case msg, ok := <-app.events:
 			if !ok {
+				if lastAppServerError != "" {
+					return "", fmt.Errorf("app-server exited while turn was running: %s", lastAppServerError)
+				}
 				return "", fmt.Errorf("app-server exited while turn was running")
 			}
+			summary.record(msg)
+			logAppServerEvent(log, msg)
 			switch msg.Method {
+			case "turn/started":
+				if activity := turnStartedActivity(msg.Params); activity != "" {
+					_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, activity)
+				}
+			case "thread/status/changed":
+				if activity := threadStatusActivity(msg.Params); activity != "" {
+					_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, activity)
+				}
+			case "turn/plan/updated":
+				if activity := turnPlanActivity(msg.Params); activity != "" {
+					_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, activity)
+				}
+			case "item/started":
+				if activity := startedItemActivity(msg.Params); activity != "" {
+					_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, activity)
+				}
 			case "item/agentMessage/delta":
 				delta := extractString(msg.Params, "delta")
 				if delta == "" {
@@ -571,55 +674,236 @@ func waitForTurn(ctx context.Context, app *appServerClient, codexTurnID string, 
 				}
 				activity := completedItemActivity(msg.Params)
 				if activity != "" {
-					_ = patchTurnStatus(context.Background(), cl, turn.Namespace, turn.Name, func(t *kelosv1alpha1.AgentTurn) {
-						t.Status.Activity = activity
-					})
+					_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, activity)
 				}
 			case "error":
 				if message := extractString(msg.Params, "error", "message"); message != "" {
-					return "", errors.New(message)
+					lastAppServerError = sanitizeForLog(message)
+				} else {
+					lastAppServerError = "Codex App Server reported an error"
 				}
-				return "", fmt.Errorf("Codex App Server reported an error")
+				_ = patchTurnActivity(context.Background(), cl, turn.Namespace, turn.Name, "Codex app-server reported an error; waiting for final turn status")
 			case "turn/completed":
 				status := extractString(msg.Params, "turn", "status")
-				if status == "failed" {
+				switch status {
+				case "completed":
+					if final.String() == "" {
+						final.WriteString(extractString(msg.Params, "turn", "finalMessage"))
+					}
+					return strings.TrimSpace(final.String()), nil
+				case "failed":
+					if lastAppServerError != "" {
+						return "", errors.New(lastAppServerError)
+					}
+					if message := extractString(msg.Params, "turn", "error", "message"); message != "" {
+						return "", errors.New(sanitizeForLog(message))
+					}
 					return "", fmt.Errorf("Codex turn failed")
+				case "interrupted":
+					message := extractString(msg.Params, "turn", "error", "message")
+					if message == "" {
+						message = "Codex turn interrupted"
+					}
+					return "", turnInterruptedError{message: sanitizeForLog(message)}
+				default:
+					if status == "" {
+						status = "missing"
+					}
+					return "", fmt.Errorf("Codex turn completed with unsupported status %q", status)
 				}
-				if final.String() == "" {
-					final.WriteString(extractString(msg.Params, "turn", "finalMessage"))
-				}
-				if final.String() == "" {
-					final.WriteString(extractString(msg.Params, "turn", "error", "message"))
-				}
-				return strings.TrimSpace(final.String()), nil
 			}
 		}
 	}
+}
+
+type appServerTurnSummary struct {
+	counts             map[string]int
+	agentDeltaBytes    int
+	commandOutputBytes int
+}
+
+func newAppServerTurnSummary() *appServerTurnSummary {
+	return &appServerTurnSummary{counts: map[string]int{}}
+}
+
+func (s *appServerTurnSummary) record(msg rpcMessage) {
+	if s == nil {
+		return
+	}
+	s.counts[msg.Method]++
+	switch msg.Method {
+	case "item/agentMessage/delta":
+		delta := extractString(msg.Params, "delta")
+		if delta == "" {
+			delta = extractString(msg.Params, "text")
+		}
+		s.agentDeltaBytes += len(delta)
+	case "item/commandExecution/outputDelta":
+		delta := extractString(msg.Params, "delta")
+		if delta == "" {
+			delta = extractString(msg.Params, "text")
+		}
+		s.commandOutputBytes += len(delta)
+	}
+}
+
+func (s *appServerTurnSummary) log(log logr.Logger) {
+	if s == nil {
+		return
+	}
+	log.Info("codex_app_server_turn_summary",
+		"event_counts", s.counts,
+		"agent_delta_bytes", s.agentDeltaBytes,
+		"command_output_delta_bytes", s.commandOutputBytes,
+	)
+}
+
+func logAppServerEvent(log logr.Logger, msg rpcMessage) {
+	switch msg.Method {
+	case "item/agentMessage/delta", "item/commandExecution/outputDelta":
+		return
+	}
+	values := []interface{}{"event_type", msg.Method}
+	switch msg.Method {
+	case "item/started", "item/completed", "item/updated":
+		values = append(values,
+			"item_type", extractString(msg.Params, "item", "type"),
+			"item_status", extractString(msg.Params, "item", "status"),
+			"command", commandSummary(msg.Params),
+			"tool", sanitizeForLog(extractString(msg.Params, "item", "tool")),
+		)
+	case "turn/completed":
+		values = append(values, "turn_status", extractString(msg.Params, "turn", "status"))
+	case "thread/status/changed":
+		values = append(values, "thread_status", extractString(msg.Params, "status"))
+	case "error":
+		values = append(values, "error", sanitizeForLog(extractString(msg.Params, "error", "message")))
+	}
+	log.Info("codex_app_server_event", values...)
+}
+
+func turnStartedActivity(params json.RawMessage) string {
+	if id := extractString(params, "turn", "id"); id != "" {
+		return "Codex app-server started turn"
+	}
+	return ""
+}
+
+func threadStatusActivity(params json.RawMessage) string {
+	status := extractString(params, "status")
+	if status == "" {
+		status = extractString(params, "thread", "status")
+	}
+	if status == "" {
+		return ""
+	}
+	return truncateRunes("Codex session status: "+sanitizeForLog(status), maxActivityRunes)
+}
+
+func turnPlanActivity(params json.RawMessage) string {
+	if plan := extractString(params, "plan"); plan != "" {
+		return truncateRunes("Updated plan: "+sanitizeForLog(plan), maxActivityRunes)
+	}
+	return "Updated plan"
+}
+
+func startedItemActivity(params json.RawMessage) string {
+	itemType := extractString(params, "item", "type")
+	switch itemType {
+	case "commandExecution":
+		if cmd := commandSummary(params); cmd != "" {
+			return "Running command: " + cmd
+		}
+		return "Running command"
+	case "mcpToolCall":
+		if tool := sanitizeForLog(extractString(params, "item", "tool")); tool != "" {
+			return "Calling MCP tool: " + tool
+		}
+		return "Calling MCP tool"
+	}
+	return ""
 }
 
 func completedItemActivity(params json.RawMessage) string {
 	itemType := extractString(params, "item", "type")
 	switch itemType {
 	case "commandExecution":
-		cmd := extractString(params, "item", "command")
+		cmd := commandSummary(params)
 		status := extractString(params, "item", "status")
 		if cmd != "" && status != "" {
-			return fmt.Sprintf("%s: %s", status, cmd)
+			return truncateRunes(fmt.Sprintf("%s command: %s", status, cmd), maxActivityRunes)
 		}
 	case "mcpToolCall":
-		tool := extractString(params, "item", "tool")
+		tool := sanitizeForLog(extractString(params, "item", "tool"))
 		status := extractString(params, "item", "status")
 		if tool != "" && status != "" {
-			return fmt.Sprintf("%s: %s", status, tool)
+			return truncateRunes(fmt.Sprintf("%s MCP tool: %s", status, tool), maxActivityRunes)
 		}
 	}
 	return ""
+}
+
+func commandSummary(params json.RawMessage) string {
+	cmd := extractString(params, "item", "command")
+	if cmd == "" {
+		cmd = extractString(params, "command")
+	}
+	return truncateRunes(sanitizeForLog(cmd), 160)
+}
+
+var secretValuePattern = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+|token=|_authtoken=|password=|[A-Z0-9_]*(?:TOKEN|KEY|SECRET)=)([^\s'"` + "`" + `]+)`)
+
+func sanitizeForLog(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = secretValuePattern.ReplaceAllString(s, "${1}<redacted>")
+	return strings.TrimSpace(s)
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-3]) + "..."
+}
+
+func classifyAppServerDiagnostic(line string) (appServerDiagnostic, bool) {
+	if strings.Contains(line, "write_stdin failed: stdin is closed") {
+		return appServerDiagnostic{
+			Kind:     "interactive_tool_without_pty",
+			Message:  line,
+			Activity: "Tool session stdin closed; rerun interactive commands with tty=true",
+		}, true
+	}
+	return appServerDiagnostic{}, false
 }
 
 func failTurn(ctx context.Context, cl client.Client, session *kelosv1alpha1.AgentSession, turn *kelosv1alpha1.AgentTurn, message string) error {
 	now := metav1.Now()
 	if err := patchTurnStatus(ctx, cl, turn.Namespace, turn.Name, func(t *kelosv1alpha1.AgentTurn) {
 		t.Status.Phase = kelosv1alpha1.AgentTurnPhaseFailed
+		t.Status.CompletedAt = &now
+		t.Status.Message = message
+	}); err != nil {
+		return err
+	}
+	return patchSessionStatus(ctx, cl, session.Namespace, session.Name, func(s *kelosv1alpha1.AgentSession) {
+		s.Status.Phase = kelosv1alpha1.AgentSessionPhaseIdle
+		s.Status.CurrentTurn = ""
+		s.Status.LastCompletedTurn = turn.Name
+		s.Status.LastActivityAt = &now
+		s.Status.Message = message
+	})
+}
+
+func cancelTurn(ctx context.Context, cl client.Client, session *kelosv1alpha1.AgentSession, turn *kelosv1alpha1.AgentTurn, message string) error {
+	now := metav1.Now()
+	if err := patchTurnStatus(ctx, cl, turn.Namespace, turn.Name, func(t *kelosv1alpha1.AgentTurn) {
+		t.Status.Phase = kelosv1alpha1.AgentTurnPhaseCanceled
 		t.Status.CompletedAt = &now
 		t.Status.Message = message
 	}); err != nil {
@@ -666,6 +950,7 @@ Current explicit request:
 Reply once in the same Slack thread through the Kelos reporter.
 Treat leading route prefixes such as !session as routing metadata only.
 Do not assume messages outside the provided delta happened after your last answer.
+For shell commands that require follow-up stdin, an interactive prompt, or a long-running session you need to write to later, start the command with a TTY. If a previous command reports that stdin is closed, rerun it as an interactive TTY session instead of retrying write_stdin.
 If you need more information, ask for it in your final answer.`,
 		session.Namespace,
 		session.Name,
@@ -697,6 +982,15 @@ func patchTurnStatus(ctx context.Context, cl client.Client, namespace, name stri
 		}
 		mutate(&turn)
 		return cl.Status().Update(ctx, &turn)
+	})
+}
+
+func patchTurnActivity(ctx context.Context, cl client.Client, namespace, name, activity string) error {
+	if activity == "" {
+		return nil
+	}
+	return patchTurnStatus(ctx, cl, namespace, name, func(t *kelosv1alpha1.AgentTurn) {
+		t.Status.Activity = truncateRunes(sanitizeForLog(activity), maxActivityRunes)
 	})
 }
 
