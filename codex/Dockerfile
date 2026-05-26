@@ -134,8 +134,8 @@ COPY codex/scripts/kelos-agent-setup /usr/local/bin/kelos-agent-setup
 # gh + npm + pnpm wrappers sit at /usr/local/bin (ahead of /usr/bin in
 # PATH) so every `gh` invocation picks up an App installation token and
 # every `npm`/`pnpm` invocation gets NODE_AUTH_TOKEN for the
-# @quantum-wealth scope. pnpm needs its own wrapper because it does not
-# shell out to npm — it reads .npmrc and the env directly.
+# @quantum-wealth scope from the package-token broker route. pnpm needs its
+# own wrapper because it does not shell out to npm.
 COPY codex/scripts/gh /usr/local/bin/gh
 COPY codex/scripts/npm /usr/local/bin/npm
 COPY codex/scripts/pnpm /usr/local/bin/pnpm

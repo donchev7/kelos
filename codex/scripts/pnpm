@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pnpm wrapper: requests a fresh GitHub App installation token from cody-tools
-# and exports it as NODE_AUTH_TOKEN before exec'ing the real pnpm binary.
+# pnpm wrapper: requests a GitHub Packages token from cody-tools and exports it
+# as NODE_AUTH_TOKEN before exec'ing the real pnpm binary.
 #
 # Sits at /usr/local/bin/pnpm, which is ahead of /usr/bin/pnpm in PATH, so
 # any `pnpm` invocation (from the agent, from shells, from scripts) picks
@@ -16,11 +16,9 @@
 # or a previous wrapped npm call in the same shell), the wrapper does
 # nothing — the existing token wins and real pnpm sees it unchanged.
 #
-# Requires the GitHub App to have `packages: read` enabled on the
-# installation. Without that the minted token returns 403 against the
-# npm.pkg.github.com registry; the App's installation token endpoint
-# will still succeed, so the failure surfaces as `pnpm ERR_PNPM_FETCH_403`
-# on first private-package fetch, not at token mint time.
+# cody-tools keeps the package token server-side and returns it through the
+# package-token route only when pnpm runs. GitHub App tokens remain used for
+# git and gh, not for npm.pkg.github.com package installs.
 set -euo pipefail
 
 if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then

@@ -47,11 +47,13 @@ const (
 	envGitHubAppClientID          = "CODY_TOOLS_GITHUB_APP_CLIENT_ID"
 	envGitHubAppInstallationID    = "CODY_TOOLS_GITHUB_APP_INSTALLATION_ID"
 	envGitHubAppPrivateKey        = "CODY_TOOLS_GITHUB_APP_PRIVATE_KEY"
+	envGitHubPackagesToken        = "CODY_TOOLS_GITHUB_PACKAGES_TOKEN"
 	aikidoRoute                   = "/aikido"
 	atlassianRoute                = "/mcp/atlassian"
 	contextRoute                  = "/mcp/context"
 	githubRoute                   = "/github"
 	githubTokenRoute              = githubRoute + "/app/installations/token"
+	githubPackagesTokenRoute      = githubRoute + "/packages/token"
 	githubCredentialRoute         = githubRoute + "/credential"
 	aikidoAuthorizationError      = "aikido credentials are not configured"
 	contextDisabledError          = "cody context is not configured"
@@ -89,6 +91,7 @@ type config struct {
 	githubAppClientID   string
 	githubInstallation  string
 	githubPrivateKey    string
+	githubPackagesToken string
 }
 
 type server struct {
@@ -181,6 +184,7 @@ func loadConfig() (config, error) {
 		githubAppClientID:   strings.TrimSpace(os.Getenv(envGitHubAppClientID)),
 		githubInstallation:  strings.TrimSpace(os.Getenv(envGitHubAppInstallationID)),
 		githubPrivateKey:    strings.TrimSpace(os.Getenv(envGitHubAppPrivateKey)),
+		githubPackagesToken: strings.TrimSpace(os.Getenv(envGitHubPackagesToken)),
 	}
 	clientID, clientSecret, err := aikidoClientCredentialsFromEnv(
 		os.Getenv(envAikidoClientCredentials),
@@ -466,13 +470,14 @@ func (s *server) handleContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleGitHub(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	status, purpose, err := s.forwardGitHub(w, r)
+	status, purpose, source, err := s.forwardGitHub(w, r)
 	duration := time.Since(start)
 	logArgs := []any{
 		"adapter", "github",
 		"route", githubRoute,
 		"path", strings.TrimPrefix(r.URL.Path, githubRoute),
 		"purpose", purpose,
+		"source", source,
 		"http_method", r.Method,
 		"status", status,
 		"duration_ms", duration.Milliseconds(),
@@ -498,6 +503,12 @@ type githubTokenResponse struct {
 	Source    string    `json:"source"`
 }
 
+type githubPackagesTokenResponse struct {
+	Token     string     `json:"token"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Source    string     `json:"source"`
+}
+
 type githubCredentialRequest struct {
 	Protocol string `json:"protocol"`
 	Host     string `json:"host"`
@@ -510,32 +521,34 @@ type githubCredentialResponse struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
-func (s *server) forwardGitHub(w http.ResponseWriter, r *http.Request) (int, string, error) {
-	if r.URL.Path != githubTokenRoute && r.URL.Path != githubCredentialRoute {
+func (s *server) forwardGitHub(w http.ResponseWriter, r *http.Request) (int, string, string, error) {
+	if r.URL.Path != githubTokenRoute && r.URL.Path != githubCredentialRoute && r.URL.Path != githubPackagesTokenRoute {
 		http.NotFound(w, r)
-		return http.StatusNotFound, "", fmt.Errorf("unknown github route %s", r.URL.Path)
+		return http.StatusNotFound, "", "", fmt.Errorf("unknown github route %s", r.URL.Path)
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return http.StatusMethodNotAllowed, "", fmt.Errorf("method %s is not allowed", r.Method)
+		return http.StatusMethodNotAllowed, "", "", fmt.Errorf("method %s is not allowed", r.Method)
 	}
 	switch r.URL.Path {
 	case githubTokenRoute:
 		return s.handleGitHubToken(w, r)
+	case githubPackagesTokenRoute:
+		return s.handleGitHubPackagesToken(w, r)
 	case githubCredentialRoute:
 		return s.handleGitHubCredential(w, r)
 	default:
 		http.NotFound(w, r)
-		return http.StatusNotFound, "", fmt.Errorf("unknown github route %s", r.URL.Path)
+		return http.StatusNotFound, "", "", fmt.Errorf("unknown github route %s", r.URL.Path)
 	}
 }
 
-func (s *server) handleGitHubToken(w http.ResponseWriter, r *http.Request) (int, string, error) {
+func (s *server) handleGitHubToken(w http.ResponseWriter, r *http.Request) (int, string, string, error) {
 	var request githubTokenRequest
 	if err := decodeOptionalJSON(r, &request); err != nil {
 		http.Error(w, "invalid github token request", http.StatusBadRequest)
-		return http.StatusBadRequest, "", err
+		return http.StatusBadRequest, "", "", err
 	}
 	purpose := strings.TrimSpace(request.Purpose)
 	if purpose == "" {
@@ -543,42 +556,77 @@ func (s *server) handleGitHubToken(w http.ResponseWriter, r *http.Request) (int,
 	}
 	if len(request.Repositories) > 0 || len(request.RepositoryIDs) > 0 || len(request.Permissions) > 0 {
 		http.Error(w, "repository and permission downscoping is not supported", http.StatusBadRequest)
-		return http.StatusBadRequest, purpose, errors.New("github token request included unsupported downscoping fields")
+		return http.StatusBadRequest, purpose, "", errors.New("github token request included unsupported downscoping fields")
 	}
 	token, err := s.generateGitHubInstallationToken(r.Context())
 	if err != nil {
 		http.Error(w, githubDisabledError, http.StatusServiceUnavailable)
-		return http.StatusServiceUnavailable, purpose, err
+		return http.StatusServiceUnavailable, purpose, "", err
 	}
 	writeJSON(w, githubTokenResponse{
 		Token:     token.Token,
 		ExpiresAt: token.ExpiresAt,
 		Source:    "github_app_installation",
 	})
-	return http.StatusOK, purpose, nil
+	return http.StatusOK, purpose, "github_app_installation", nil
 }
 
-func (s *server) handleGitHubCredential(w http.ResponseWriter, r *http.Request) (int, string, error) {
-	var request githubCredentialRequest
+func (s *server) handleGitHubPackagesToken(w http.ResponseWriter, r *http.Request) (int, string, string, error) {
+	var request githubTokenRequest
 	if err := decodeOptionalJSON(r, &request); err != nil {
-		http.Error(w, "invalid github credential request", http.StatusBadRequest)
-		return http.StatusBadRequest, "", err
+		http.Error(w, "invalid github packages token request", http.StatusBadRequest)
+		return http.StatusBadRequest, "", "", err
 	}
-	if request.Protocol != "https" || !githubCredentialHostAllowed(request.Host) {
-		writeJSON(w, githubCredentialResponse{})
-		return http.StatusOK, "credential", nil
+	purpose := strings.TrimSpace(request.Purpose)
+	if purpose == "" {
+		purpose = "packages"
+	}
+	if len(request.Repositories) > 0 || len(request.RepositoryIDs) > 0 || len(request.Permissions) > 0 {
+		http.Error(w, "repository and permission downscoping is not supported", http.StatusBadRequest)
+		return http.StatusBadRequest, purpose, "", errors.New("github packages token request included unsupported downscoping fields")
+	}
+	if s.cfg.githubPackagesToken != "" {
+		writeJSON(w, githubPackagesTokenResponse{
+			Token:  s.cfg.githubPackagesToken,
+			Source: "github_packages_token",
+		})
+		return http.StatusOK, purpose, "github_packages_token", nil
 	}
 	token, err := s.generateGitHubInstallationToken(r.Context())
 	if err != nil {
 		http.Error(w, githubDisabledError, http.StatusServiceUnavailable)
-		return http.StatusServiceUnavailable, "credential", err
+		return http.StatusServiceUnavailable, purpose, "", err
+	}
+	expiresAt := token.ExpiresAt
+	writeJSON(w, githubPackagesTokenResponse{
+		Token:     token.Token,
+		ExpiresAt: &expiresAt,
+		Source:    "github_app_installation",
+	})
+	return http.StatusOK, purpose, "github_app_installation", nil
+}
+
+func (s *server) handleGitHubCredential(w http.ResponseWriter, r *http.Request) (int, string, string, error) {
+	var request githubCredentialRequest
+	if err := decodeOptionalJSON(r, &request); err != nil {
+		http.Error(w, "invalid github credential request", http.StatusBadRequest)
+		return http.StatusBadRequest, "", "", err
+	}
+	if request.Protocol != "https" || !githubCredentialHostAllowed(request.Host) {
+		writeJSON(w, githubCredentialResponse{})
+		return http.StatusOK, "credential", "", nil
+	}
+	token, err := s.generateGitHubInstallationToken(r.Context())
+	if err != nil {
+		http.Error(w, githubDisabledError, http.StatusServiceUnavailable)
+		return http.StatusServiceUnavailable, "credential", "", err
 	}
 	writeJSON(w, githubCredentialResponse{
 		Username:  "x-access-token",
 		Password:  token.Token,
 		ExpiresAt: &token.ExpiresAt,
 	})
-	return http.StatusOK, "credential", nil
+	return http.StatusOK, "credential", "github_app_installation", nil
 }
 
 func (s *server) generateGitHubInstallationToken(ctx context.Context) (*githubapp.TokenResponse, error) {
