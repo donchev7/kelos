@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     dnsutils \
     netcat-openbsd \
     iputils-ping \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -209,9 +209,23 @@ RUN mkdir -p /usr/local/libexec \
 ENV KELOS_CURL_REAL=/usr/local/libexec/curl-real
 
 RUN useradd -u 61100 -m -s /bin/bash agent
-RUN mkdir -p /home/agent/.codex /home/agent/.local/bin && chown -R agent:agent /home/agent
+RUN mkdir -p /home/agent/.codex /home/agent/.local/bin /home/agent/.gnupg \
+    && chmod 700 /home/agent/.gnupg \
+    && chown -R agent:agent /home/agent
 
 USER agent
+
+ARG MISE_NODE_VERSION=24.12.0
+ARG NODE_RELEASE_GPG_FINGERPRINT=86C8D74642E67846F8E120284DAA80D1E737BC9F
+RUN /usr/local/libexec/curl-real -fsSL --retry 3 \
+      "https://keys.openpgp.org/vks/v1/by-fingerprint/${NODE_RELEASE_GPG_FINGERPRINT}" \
+      -o /tmp/node-release-key.asc \
+    && gpg --batch --import /tmp/node-release-key.asc \
+    && gpg --batch --list-keys --with-subkey-fingerprint --with-colons \
+      | grep -q "${NODE_RELEASE_GPG_FINGERPRINT}" \
+    && mise install "node@${MISE_NODE_VERSION}" \
+    && mise reshim "node@${MISE_NODE_VERSION}" \
+    && rm /tmp/node-release-key.asc
 
 ENV GOPATH="/home/agent/go"
 ENV PATH="/home/agent/.local/bin:${GOPATH}/bin:${PATH}"

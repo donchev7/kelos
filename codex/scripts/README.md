@@ -13,7 +13,7 @@ itself once it is running.
 | `KUBERNETES_CLUSTER_NAME` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Optional human-readable cluster name baked into `~/.kube/config`. Defaults to `in-cluster`. |
 | `GIT_AUTHOR_NAME` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Sets `git config user.name`. Without it `git commit` aborts. Defaults to `Cody (Alpheya)`. |
 | `GIT_AUTHOR_EMAIL` | Task `podOverrides.env` (literal) | `kelos-agent-setup` | Sets `git config user.email`. Defaults to `cody@alpheya.com`. |
-| `NODE_AUTH_TOKEN` | Derived at call time by `npm` / `pnpm` wrappers | `npm`, `pnpm` (wrappers) | Populated from the cody-tools `/github/packages/token` broker route so `.npmrc` lines like `_authToken=${NODE_AUTH_TOKEN}` against `npm.pkg.github.com` resolve to the configured package token. Pre-set values are honored (operator override). |
+| `NODE_AUTH_TOKEN` | Derived at call time by `npm` / `pnpm` wrappers | `npm`, `pnpm` (wrappers) | Populated from the cody-tools `/github/packages/token` broker route so `.npmrc` lines like `_authToken=${NODE_AUTH_TOKEN}` against `npm.pkg.github.com` resolve to the configured package token. `kelos-agent-setup` writes the user-level `@quantum-wealth` registry config when the broker URL is present. Pre-set values are honored (operator override). |
 | `ALPHEYA_TOKEN_SIGNING_KEY` | Task `podOverrides.env` (Secret) | `kelos-jwt`, `curl` (wrapper) | PEM (RS256) or HMAC bytes (HS256). Literal `\n` from sealed-secret env vars is unescaped before signing. |
 | `ALPHEYA_TOKEN_SIGNING_KEY_FILE` | Task `podOverrides.env` (literal path) | `kelos-jwt`, `curl` (wrapper) | Optional fallback when `KEY` is unset. Useful when the secret is mounted as a file. |
 | `ALPHEYA_TOKEN_SIGNING_ALGORITHM` | Task `podOverrides.env` (literal) | `kelos-jwt`, `curl` (wrapper) | `RS256` (default) or `HS256`. |
@@ -34,7 +34,7 @@ The GitHub Packages fallback token is configured on `cody-tools` through
 
 ## Binaries
 
-- **`kelos-agent-setup`** — Pre-agent setup invoked from `kelos_entrypoint.sh`. Wires `git config credential.helper` to the cody-tools-backed helper when `CODY_TOOLS_GITHUB_BASE_URL` is set, and synthesises `~/.kube/config` from the projected ServiceAccount token. Each step is a no-op when its inputs are missing, so this script is safe to run unconditionally.
+- **`kelos-agent-setup`** — Pre-agent setup invoked from `kelos_entrypoint.sh`. Wires `git config credential.helper` to the cody-tools-backed helper when `CODY_TOOLS_GITHUB_BASE_URL` is set, writes user-level npm config for the `@quantum-wealth` GitHub Packages scope, and synthesises `~/.kube/config` from the projected ServiceAccount token. Each step is a no-op when its inputs are missing, so this script is safe to run unconditionally.
 - **`cody-github-credential-helper`** — Git credential helper. Reads the credential request on stdin and, for `github.com` / `api.github.com` over HTTPS, returns a fresh brokered installation token as the password. Returns nothing for other hosts so git falls through to its other helpers.
 - **`github-app-credential-helper`** — Existing command name that execs `cody-github-credential-helper`. It does not sign JWTs locally.
 - **`cody-github-token`** — Requests a brokered token from `cody-tools` and prints it to stdout. For `--purpose npm`, `--purpose pnpm`, `--purpose yarn`, and `--purpose packages`, it calls `/github/packages/token`; other purposes call `/github/app/installations/token`. It requires `CODY_TOOLS_GITHUB_BASE_URL`.
