@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -156,3 +157,11 @@ func TestParseResponseEmptyFile(t *testing.T) {
 	}
 }
 
+func writeTempFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "agent-output.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

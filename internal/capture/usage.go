@@ -17,6 +17,11 @@ type usageAccumulator interface {
 	result() map[string]string
 }
 
+type streamOutput struct {
+	usage    map[string]string
+	response string
+}
+
 // newUsageAccumulator returns the accumulator for the given agent type, or
 // nil if the type is empty or unknown.
 func newUsageAccumulator(agentType string) usageAccumulator {
@@ -47,7 +52,13 @@ func newUsageAccumulator(agentType string) usageAccumulator {
 // forwarded faithfully (memory cost is bounded by the longest line, which
 // the agent producer is already holding).
 func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]string, err error) {
-	acc := newUsageAccumulator(agentType)
+	result, err := streamAgentOutput(agentType, r, w)
+	return result.usage, err
+}
+
+func streamAgentOutput(agentType string, r io.Reader, w io.Writer) (result streamOutput, err error) {
+	usageAcc := newUsageAccumulator(agentType)
+	responseAcc := newResponseAccumulator(agentType)
 	bw := bufio.NewWriter(w)
 	defer func() {
 		if ferr := bw.Flush(); err == nil {
@@ -59,7 +70,7 @@ func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]s
 		line, readErr := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := bw.Write(line); werr != nil {
-				return nil, werr
+				return streamOutput{}, werr
 			}
 			// ReadBytes returns the bytes up to and including the
 			// delimiter; if the stream ended without a newline,
@@ -67,16 +78,19 @@ func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]s
 			// produced.
 			if line[len(line)-1] != '\n' {
 				if werr := bw.WriteByte('\n'); werr != nil {
-					return nil, werr
+					return streamOutput{}, werr
 				}
 			}
-			if acc != nil {
-				body := line
-				if body[len(body)-1] == '\n' {
-					body = body[:len(body)-1]
+			body := line
+			if body[len(body)-1] == '\n' {
+				body = body[:len(body)-1]
+			}
+			if len(body) > 0 {
+				if usageAcc != nil {
+					usageAcc.addLine(body)
 				}
-				if len(body) > 0 {
-					acc.addLine(body)
+				if responseAcc != nil {
+					responseAcc.addLine(body)
 				}
 			}
 		}
@@ -84,13 +98,16 @@ func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]s
 			if readErr == io.EOF {
 				break
 			}
-			return nil, readErr
+			return streamOutput{}, readErr
 		}
 	}
-	if acc == nil {
-		return nil, nil
+	if usageAcc != nil {
+		result.usage = usageAcc.result()
 	}
-	return acc.result(), nil
+	if responseAcc != nil {
+		result.response = responseAcc.result()
+	}
+	return result, nil
 }
 
 // lastResultAccumulator keeps only the most recent line whose "type" is

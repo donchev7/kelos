@@ -197,6 +197,17 @@ func TestCaptureOutputsNoMarkersWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestCaptureOutputsWithResponse(t *testing.T) {
+	r := mockRunner{commands: map[string]mockResult{
+		"git rev-parse --is-inside-work-tree": {err: fmt.Errorf("not a git repo")},
+	}}
+
+	outputs := captureOutputsWithResponse(r, nil, "Final answer.")
+
+	expected := []string{"response: RmluYWwgYW5zd2VyLg=="}
+	assertOutputLines(t, expected, outputs)
+}
+
 func TestCapturePRsInvalidJSON(t *testing.T) {
 	r := mockRunner{commands: map[string]mockResult{
 		"gh pr list --head branch --json url": {output: "not json"},

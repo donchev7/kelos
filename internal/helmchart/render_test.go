@@ -175,8 +175,8 @@ func TestRender_TaskSpawnerTemplatePlaceholdersRemainLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rendering chart: %v", err)
 	}
-	output := string(data)
-	if !strings.Contains(output, `Supports Go text/template variables from the work item, e.g. "kelos-task-{{.Number}}".`) {
+	doc := renderedDocument(t, data, "CustomResourceDefinition", "taskspawners.kelos.dev")
+	if !strings.Contains(doc, `Supports Go text/template variables from the work item, e.g. "kelos-task-{{.Number}}".`) {
 		t.Error("expected branch placeholder example to remain literal in rendered CRD output")
 	}
 	for _, expected := range []string{
@@ -185,10 +185,42 @@ func TestRender_TaskSpawnerTemplatePlaceholdersRemainLiteral(t *testing.T) {
 		"GitHub pull request sources additionally expose: {{.Branch}}, {{.ReviewState}}, {{.ReviewComments}}",
 		"Cron sources: {{.Time}}, {{.Schedule}}",
 	} {
-		if count := strings.Count(output, expected); count != 2 {
+		if count := strings.Count(doc, expected); count != 2 {
 			t.Errorf("expected %q to appear twice in TaskSpawner CRD descriptions, got %d", expected, count)
 		}
 	}
+}
+
+func renderedDocument(t *testing.T, data []byte, kind, name string) string {
+	t.Helper()
+	reader := yamlutil.NewYAMLReader(bufio.NewReader(bytes.NewReader(data)))
+	for {
+		doc, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading YAML document: %v", err)
+		}
+		trimmed := bytes.TrimSpace(doc)
+		if len(trimmed) == 0 {
+			continue
+		}
+		var obj map[string]interface{}
+		if err := sigyaml.Unmarshal(trimmed, &obj); err != nil {
+			continue
+		}
+		if obj["kind"] != kind {
+			continue
+		}
+		metadata, ok := obj["metadata"].(map[string]interface{})
+		if !ok || metadata["name"] != name {
+			continue
+		}
+		return string(trimmed)
+	}
+	t.Fatalf("expected rendered %s named %s", kind, name)
+	return ""
 }
 
 func TestRender_CRDKeepAnnotation(t *testing.T) {

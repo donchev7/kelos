@@ -15,7 +15,8 @@ import (
 // Returns an empty string if the file is unreadable, the agent type is
 // unknown, or the agent produced no extractable response text.
 func ParseResponse(agentType, filePath string) string {
-	if agentType == "" {
+	acc := newResponseAccumulator(agentType)
+	if acc == nil {
 		return ""
 	}
 	f, err := os.Open(filePath)
@@ -24,175 +25,183 @@ func ParseResponse(agentType, filePath string) string {
 	}
 	defer f.Close()
 
-	var lines [][]byte
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	for scanner.Scan() {
-		lines = append(lines, append([]byte(nil), scanner.Bytes()...))
+		acc.addLine(scanner.Bytes())
 	}
-	if len(lines) == 0 {
-		return ""
-	}
+	return acc.result()
+}
 
+type responseAccumulator interface {
+	addLine(line []byte)
+	result() string
+}
+
+func newResponseAccumulator(agentType string) responseAccumulator {
 	switch agentType {
 	case "claude-code":
-		return parseClaudeCodeResponse(lines)
+		return &assistantResultResponseAccumulator{joiner: "\n\n"}
 	case "codex":
-		return parseCodexResponse(lines)
+		return &codexResponseAccumulator{}
 	case "gemini":
-		return parseGeminiResponse(lines)
+		return &geminiResponseAccumulator{}
 	case "opencode":
-		return parseOpencodeResponse(lines)
+		return &opencodeResponseAccumulator{}
 	case "cursor":
-		return parseCursorResponse(lines)
+		return &assistantResultResponseAccumulator{joiner: "\n\n"}
 	default:
-		return ""
+		return nil
 	}
 }
 
-// parseCodexResponse concatenates the text of every
-// {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-// event, in order. Codex may emit several agent_message items across turns
-// or alongside tool use, so joining them preserves the full visible answer.
-func parseCodexResponse(lines [][]byte) string {
-	var parts []string
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil || m["type"] != "item.completed" {
-			continue
-		}
-		item, ok := m["item"].(map[string]any)
-		if !ok || item["type"] != "agent_message" {
-			continue
-		}
-		if text, ok := item["text"].(string); ok && text != "" {
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, "\n\n")
+type codexResponseAccumulator struct {
+	parts []string
 }
 
-// parseClaudeCodeResponse extracts the assistant message text. Claude
-// Code's stream-json format emits text in either:
-//   - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-//     (one per turn during the run), or
-//   - {"type":"result","result":"..."} (a final summary line).
-//
-// The final summary is preferred when present; otherwise we fall back to
-// the concatenated text blocks across all assistant turns.
-func parseClaudeCodeResponse(lines [][]byte) string {
-	if last := findLastByType(lines, "result"); last != nil {
-		if result, ok := last["result"].(string); ok && result != "" {
-			return result
-		}
+func (a *codexResponseAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil || m["type"] != "item.completed" {
+		return
 	}
-	var parts []string
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil || m["type"] != "assistant" {
-			continue
-		}
-		msg, ok := m["message"].(map[string]any)
-		if !ok {
-			continue
-		}
-		content, ok := msg["content"].([]any)
-		if !ok {
-			continue
-		}
-		for _, block := range content {
-			b, ok := block.(map[string]any)
-			if !ok || b["type"] != "text" {
-				continue
-			}
-			if text, ok := b["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-			}
-		}
+	item, ok := m["item"].(map[string]any)
+	if !ok || item["type"] != "agent_message" {
+		return
 	}
-	return strings.Join(parts, "\n\n")
+	if text, ok := item["text"].(string); ok && text != "" {
+		a.parts = append(a.parts, text)
+	}
 }
 
-// parseGeminiResponse concatenates the text of every
-// {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-// event. Gemini follows the same assistant-content shape as claude-code
-// for visible output (the final {"type":"result"} line carries only stats).
-func parseGeminiResponse(lines [][]byte) string {
-	var parts []string
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil {
+func (a *codexResponseAccumulator) result() string {
+	return strings.Join(a.parts, "\n\n")
+}
+
+// assistantResultResponseAccumulator handles agent formats where assistant
+// messages contain text blocks and an optional trailing result carries the
+// preferred final answer.
+type assistantResultResponseAccumulator struct {
+	final  string
+	parts  []string
+	joiner string
+}
+
+func (a *assistantResultResponseAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil {
+		return
+	}
+	if m["type"] == "result" {
+		if result, ok := m["result"].(string); ok && result != "" {
+			a.final = result
+		}
+		return
+	}
+	if m["type"] != "assistant" {
+		return
+	}
+	a.addAssistantContent(m)
+}
+
+func (a *assistantResultResponseAccumulator) addAssistantContent(m map[string]any) {
+	msg, ok := m["message"].(map[string]any)
+	if !ok {
+		return
+	}
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok || b["type"] != "text" {
 			continue
 		}
-		// Streamed text events: {"type":"text","text":"..."}
-		if m["type"] == "text" {
-			if text, ok := m["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-			}
-			continue
-		}
-		// Structured assistant events with content blocks.
-		if m["type"] != "assistant" {
-			continue
-		}
-		msg, ok := m["message"].(map[string]any)
-		if !ok {
-			continue
-		}
-		content, ok := msg["content"].([]any)
-		if !ok {
-			continue
-		}
-		for _, block := range content {
-			b, ok := block.(map[string]any)
-			if !ok || b["type"] != "text" {
-				continue
-			}
-			if text, ok := b["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-			}
+		if text, ok := b["text"].(string); ok && text != "" {
+			a.parts = append(a.parts, text)
 		}
 	}
-	return strings.Join(parts, "")
 }
 
-// parseOpencodeResponse extracts text from {"type":"text","text":"..."}
-// events, falling back to {"type":"step_finish","part":{"text":"..."}}
-// when the streamed text events are absent. Opencode emits raw text
-// fragments without an outer message envelope.
-func parseOpencodeResponse(lines [][]byte) string {
-	var parts []string
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil {
+func (a *assistantResultResponseAccumulator) result() string {
+	if a.final != "" {
+		return a.final
+	}
+	return strings.Join(a.parts, a.joiner)
+}
+
+type geminiResponseAccumulator struct {
+	parts []string
+}
+
+func (a *geminiResponseAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil {
+		return
+	}
+	if m["type"] == "text" {
+		if text, ok := m["text"].(string); ok && text != "" {
+			a.parts = append(a.parts, text)
+		}
+		return
+	}
+	if m["type"] != "assistant" {
+		return
+	}
+	msg, ok := m["message"].(map[string]any)
+	if !ok {
+		return
+	}
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok || b["type"] != "text" {
 			continue
 		}
-		switch m["type"] {
-		case "text":
-			if text, ok := m["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-				continue
-			}
-			if part, ok := m["part"].(map[string]any); ok {
-				if text, ok := part["text"].(string); ok && text != "" {
-					parts = append(parts, text)
-				}
-			}
-		case "step_finish":
-			if part, ok := m["part"].(map[string]any); ok {
-				if text, ok := part["text"].(string); ok && text != "" {
-					parts = append(parts, text)
-				}
-			}
+		if text, ok := b["text"].(string); ok && text != "" {
+			a.parts = append(a.parts, text)
 		}
 	}
-	return strings.Join(parts, "")
 }
 
-// parseCursorResponse extracts text from cursor's stream-json output. The
-// shape mirrors claude-code: assistant events carry the visible text and
-// the trailing result event carries usage stats.
-func parseCursorResponse(lines [][]byte) string {
-	return parseClaudeCodeResponse(lines)
+func (a *geminiResponseAccumulator) result() string {
+	return strings.Join(a.parts, "")
 }
 
+type opencodeResponseAccumulator struct {
+	parts []string
+}
+
+func (a *opencodeResponseAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil {
+		return
+	}
+	switch m["type"] {
+	case "text":
+		if text, ok := m["text"].(string); ok && text != "" {
+			a.parts = append(a.parts, text)
+			return
+		}
+		a.addPartText(m)
+	case "step_finish":
+		a.addPartText(m)
+	}
+}
+
+func (a *opencodeResponseAccumulator) addPartText(m map[string]any) {
+	part, ok := m["part"].(map[string]any)
+	if !ok {
+		return
+	}
+	if text, ok := part["text"].(string); ok && text != "" {
+		a.parts = append(a.parts, text)
+	}
+}
+
+func (a *opencodeResponseAccumulator) result() string {
+	return strings.Join(a.parts, "")
+}
