@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print a fresh GitHub App installation token from cody-tools.
+# Print a brokered GitHub token from cody-tools.
 set -euo pipefail
 
 purpose="token"
@@ -24,6 +24,12 @@ done
 
 base_url="${CODY_TOOLS_GITHUB_BASE_URL%/}"
 payload=$(jq -cn --arg purpose "$purpose" '{purpose:$purpose}')
+endpoint="/app/installations/token"
+case "$purpose" in
+npm | pnpm | yarn | packages)
+  endpoint="/packages/token"
+  ;;
+esac
 
 attempts=3
 response=""
@@ -35,11 +41,11 @@ for ((i = 1; i <= attempts; i++)); do
     -H "Accept: application/json" \
     -H "Content-Type: application/json" \
     --data "$payload" \
-    "${base_url}/app/installations/token"); then
+    "${base_url}${endpoint}"); then
     break
   fi
   if ((i == attempts)); then
-    echo "cody-github-token: failed to get installation token from cody-tools after ${attempts} attempts" >&2
+    echo "cody-github-token: failed to get token from cody-tools after ${attempts} attempts" >&2
     exit 1
   fi
   sleep $((2 ** (i - 1)))

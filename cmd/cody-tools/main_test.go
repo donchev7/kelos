@@ -157,6 +157,80 @@ func TestGitHubTokenHandlerRejectsDownscopingFields(t *testing.T) {
 	}
 }
 
+func TestGitHubPackagesTokenHandlerReturnsConfiguredToken(t *testing.T) {
+	var called bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	s := newGitHubTestServer(t, upstream)
+	s.cfg.githubPackagesToken = "ghp_packages_read"
+	req := httptest.NewRequest(http.MethodPost, githubPackagesTokenRoute, strings.NewReader(`{"purpose":"npm"}`))
+	rec := httptest.NewRecorder()
+
+	s.handleGitHub(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("upstream should not be called when a package token is configured")
+	}
+	var response githubPackagesTokenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Token != "ghp_packages_read" {
+		t.Fatalf("token = %q", response.Token)
+	}
+	if response.Source != "github_packages_token" {
+		t.Fatalf("source = %q", response.Source)
+	}
+	if response.ExpiresAt != nil {
+		t.Fatalf("expires_at = %v, want nil", response.ExpiresAt)
+	}
+}
+
+func TestGitHubPackagesTokenHandlerFallsBackToInstallationToken(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{
+			"token":      "ghs_packages_fallback",
+			"expires_at": expiresAt.Format(time.RFC3339),
+		})
+	}))
+	defer upstream.Close()
+
+	s := newGitHubTestServer(t, upstream)
+	req := httptest.NewRequest(http.MethodPost, githubPackagesTokenRoute, strings.NewReader(`{"purpose":"pnpm"}`))
+	rec := httptest.NewRecorder()
+
+	s.handleGitHub(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response githubPackagesTokenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Token != "ghs_packages_fallback" {
+		t.Fatalf("token = %q", response.Token)
+	}
+	if response.Source != "github_app_installation" {
+		t.Fatalf("source = %q", response.Source)
+	}
+	if response.ExpiresAt == nil {
+		t.Fatal("expires_at is nil")
+	}
+	if !response.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expires_at = %v, want %v", response.ExpiresAt, expiresAt)
+	}
+}
+
 func TestGitHubCredentialHandlerReturnsCredentialForGitHubHost(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

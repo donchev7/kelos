@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# npm wrapper: requests a fresh GitHub App installation token from cody-tools
-# and exports it as NODE_AUTH_TOKEN before exec'ing the real npm binary.
+# npm wrapper: requests a GitHub Packages token from cody-tools and exports it
+# as NODE_AUTH_TOKEN before exec'ing the real npm binary.
 #
 # Sits at /usr/local/bin/npm, which is ahead of /usr/bin/npm in PATH, so
 # any `npm` invocation (from the agent, from shells, from hooks) picks up
@@ -13,11 +13,9 @@
 # wrapper does nothing — the existing token wins and real npm sees it
 # unchanged.
 #
-# Requires the github-app to have `packages: read` enabled on the
-# installation. Without that the minted token returns 401 against the
-# npm registry; the App's installation token endpoint will still succeed,
-# so the failure surfaces as an `npm ERR! 401 Unauthorized` on first
-# install, not at token mint time.
+# cody-tools keeps the package token server-side and returns it through the
+# package-token route only when npm runs. GitHub App tokens remain used for
+# git and gh, not for npm.pkg.github.com package installs.
 set -euo pipefail
 
 if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
