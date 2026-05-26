@@ -4,61 +4,151 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"strings"
 )
 
-// ParseUsage extracts token usage metrics from the agent output file.
-// Returns nil if the file doesn't exist or the agent type is unknown.
-func ParseUsage(agentType, filePath string) map[string]string {
-	if agentType == "" {
-		return nil
-	}
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
+// usageAccumulator consumes the agent's JSON-lines output one line at a
+// time and emits a final token usage map. Per-agent implementations keep
+// only the state they need (last "result" line or running counters), so
+// memory cost is O(1) in the size of the stream.
+type usageAccumulator interface {
+	addLine(line []byte)
+	result() map[string]string
+}
 
-	var lines [][]byte
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, append([]byte(nil), scanner.Bytes()...))
-	}
-	if len(lines) == 0 {
-		return nil
-	}
-
+// newUsageAccumulator returns the accumulator for the given agent type, or
+// nil if the type is empty or unknown.
+func newUsageAccumulator(agentType string) usageAccumulator {
 	switch agentType {
 	case "claude-code":
-		return parseClaudeCode(lines)
+		return &lastResultAccumulator{extract: extractClaudeCode}
 	case "codex":
-		return parseCodex(lines)
+		return &sumAccumulator{event: "turn.completed", extract: extractCodexUsage}
 	case "gemini":
-		return parseGemini(lines)
+		return &lastResultAccumulator{extract: extractGemini}
 	case "opencode":
-		return parseOpencode(lines)
+		return &sumAccumulator{event: "step_finish", extract: extractOpencodeUsage}
 	case "cursor":
-		return parseCursor(lines)
+		return &lastResultAccumulator{extract: extractCursor}
 	default:
 		return nil
 	}
 }
 
-// parseClaudeCode extracts cost and token counts from the last
-// {"type":"result","total_cost_usd":N,"usage":{"input_tokens":N,"output_tokens":N}} line.
-func parseClaudeCode(lines [][]byte) map[string]string {
-	last := findLastByType(lines, "result")
-	if last == nil {
+// StreamUsage reads JSON lines from r, forwards every byte to w (with a
+// final newline appended if the input did not end in one, matching what
+// `tee` produced previously), and returns the parsed token usage for the
+// given agent type. Returns nil usage for empty/unknown agent types or
+// when no usage data is present.
+//
+// Bytes from r are forwarded to w exactly as read, in order — there is no
+// scanner buffer between us and r, so an arbitrarily long line is still
+// forwarded faithfully (memory cost is bounded by the longest line, which
+// the agent producer is already holding).
+func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]string, err error) {
+	acc := newUsageAccumulator(agentType)
+	bw := bufio.NewWriter(w)
+	defer func() {
+		if ferr := bw.Flush(); err == nil {
+			err = ferr
+		}
+	}()
+	br := bufio.NewReader(r)
+	for {
+		line, readErr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			if _, werr := bw.Write(line); werr != nil {
+				return nil, werr
+			}
+			// ReadBytes returns the bytes up to and including the
+			// delimiter; if the stream ended without a newline,
+			// append one so forwarded output matches what `tee`
+			// produced.
+			if line[len(line)-1] != '\n' {
+				if werr := bw.WriteByte('\n'); werr != nil {
+					return nil, werr
+				}
+			}
+			if acc != nil {
+				body := line
+				if body[len(body)-1] == '\n' {
+					body = body[:len(body)-1]
+				}
+				if len(body) > 0 {
+					acc.addLine(body)
+				}
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return nil, readErr
+		}
+	}
+	if acc == nil {
+		return nil, nil
+	}
+	return acc.result(), nil
+}
+
+// lastResultAccumulator keeps only the most recent line whose "type" is
+// "result" and runs extract on it at EOF. Used by claude-code, gemini, and
+// cursor whose totals live in the final result line.
+type lastResultAccumulator struct {
+	last    map[string]any
+	extract func(map[string]any) map[string]string
+}
+
+func (a *lastResultAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil {
+		return
+	}
+	if m["type"] == "result" {
+		a.last = m
+	}
+}
+
+func (a *lastResultAccumulator) result() map[string]string {
+	if a.last == nil {
 		return nil
 	}
+	return a.extract(a.last)
+}
+
+// sumAccumulator adds per-event input/output token counts as the stream is
+// read. Used by codex and opencode whose totals are spread across many
+// per-turn or per-step events.
+type sumAccumulator struct {
+	event   string
+	extract func(map[string]any) (int64, int64)
+	in, out int64
+}
+
+func (a *sumAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil || m["type"] != a.event {
+		return
+	}
+	i, o := a.extract(m)
+	a.in += i
+	a.out += o
+}
+
+func (a *sumAccumulator) result() map[string]string {
+	return tokenResult(a.in, a.out)
+}
+
+// extractClaudeCode reads cost and token counts from a claude-code
+// {"type":"result","total_cost_usd":N,"usage":{"input_tokens":N,"output_tokens":N}} line.
+func extractClaudeCode(m map[string]any) map[string]string {
 	result := make(map[string]string)
-	if v, ok := last["total_cost_usd"]; ok {
+	if v, ok := m["total_cost_usd"]; ok {
 		result["cost-usd"] = formatNumber(v)
 	}
-	// Token counts live under the "usage" object in current claude-code versions.
-	if usage, ok := last["usage"].(map[string]any); ok {
+	if usage, ok := m["usage"].(map[string]any); ok {
 		if v, ok := usage["input_tokens"]; ok {
 			result["input-tokens"] = formatNumber(v)
 		}
@@ -72,16 +162,12 @@ func parseClaudeCode(lines [][]byte) map[string]string {
 	return result
 }
 
-// parseCursor extracts token counts from the last
+// extractCursor reads token counts from a cursor
 // {"type":"result","usage":{"inputTokens":N,"outputTokens":N}} line.
 // Cursor uses camelCase field names instead of claude-code's snake_case.
-func parseCursor(lines [][]byte) map[string]string {
-	last := findLastByType(lines, "result")
-	if last == nil {
-		return nil
-	}
+func extractCursor(m map[string]any) map[string]string {
 	result := make(map[string]string)
-	if usage, ok := last["usage"].(map[string]any); ok {
+	if usage, ok := m["usage"].(map[string]any); ok {
 		if v, ok := usage["inputTokens"]; ok {
 			result["input-tokens"] = formatNumber(v)
 		}
@@ -95,32 +181,10 @@ func parseCursor(lines [][]byte) map[string]string {
 	return result
 }
 
-// parseCodex sums input_tokens and output_tokens across all
-// {"type":"turn.completed",...} events.
-func parseCodex(lines [][]byte) map[string]string {
-	var inputTotal, outputTotal int64
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil || m["type"] != "turn.completed" {
-			continue
-		}
-		usage, ok := m["usage"].(map[string]any)
-		if !ok {
-			continue
-		}
-		inputTotal += toInt64(usage["input_tokens"])
-		outputTotal += toInt64(usage["output_tokens"])
-	}
-	return tokenResult(inputTotal, outputTotal)
-}
-
-// parseGemini extracts token counts from the last {"type":"result","stats":{...}} line.
-func parseGemini(lines [][]byte) map[string]string {
-	last := findLastByType(lines, "result")
-	if last == nil {
-		return nil
-	}
-	stats, ok := last["stats"].(map[string]any)
+// extractGemini reads token counts from a gemini
+// {"type":"result","stats":{"inputTokens":N,"outputTokens":N}} line.
+func extractGemini(m map[string]any) map[string]string {
+	stats, ok := m["stats"].(map[string]any)
 	if !ok {
 		return nil
 	}
@@ -137,27 +201,28 @@ func parseGemini(lines [][]byte) map[string]string {
 	return result
 }
 
-// parseOpencode sums input and output tokens across all
-// {"type":"step_finish",...} events.
-func parseOpencode(lines [][]byte) map[string]string {
-	var inputTotal, outputTotal int64
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil || m["type"] != "step_finish" {
-			continue
-		}
-		part, ok := m["part"].(map[string]any)
-		if !ok {
-			continue
-		}
-		tokens, ok := part["tokens"].(map[string]any)
-		if !ok {
-			continue
-		}
-		inputTotal += toInt64(tokens["input"])
-		outputTotal += toInt64(tokens["output"])
+// extractCodexUsage pulls (input, output) from a codex
+// {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N}} event.
+func extractCodexUsage(m map[string]any) (int64, int64) {
+	usage, ok := m["usage"].(map[string]any)
+	if !ok {
+		return 0, 0
 	}
-	return tokenResult(inputTotal, outputTotal)
+	return toInt64(usage["input_tokens"]), toInt64(usage["output_tokens"])
+}
+
+// extractOpencodeUsage pulls (input, output) from an opencode
+// {"type":"step_finish","part":{"tokens":{"input":N,"output":N}}} event.
+func extractOpencodeUsage(m map[string]any) (int64, int64) {
+	part, ok := m["part"].(map[string]any)
+	if !ok {
+		return 0, 0
+	}
+	tokens, ok := part["tokens"].(map[string]any)
+	if !ok {
+		return 0, 0
+	}
+	return toInt64(tokens["input"]), toInt64(tokens["output"])
 }
 
 // tokenResult builds a result map from token sums, returning nil if both are zero.
@@ -184,21 +249,6 @@ func parseLine(line []byte) map[string]any {
 		return nil
 	}
 	return m
-}
-
-// findLastByType returns the last JSON object with the given "type" field.
-func findLastByType(lines [][]byte, typ string) map[string]any {
-	var last map[string]any
-	for _, line := range lines {
-		m := parseLine(line)
-		if m == nil {
-			continue
-		}
-		if m["type"] == typ {
-			last = m
-		}
-	}
-	return last
 }
 
 // formatNumber converts a JSON number value to a string, preserving the

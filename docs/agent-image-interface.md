@@ -112,9 +112,10 @@ failures when tailing pod logs.
 
 ## Output Capture
 
-After the agent exits, the entrypoint should run `/kelos/kelos-capture` to
-emit deterministic outputs (branch name, PR URLs) to stdout. The controller
-reads Pod logs and extracts lines between the following markers:
+The entrypoint should pipe the agent's stdout into `/kelos/kelos-capture`,
+which forwards the stream unchanged to its own stdout and emits
+deterministic outputs (branch name, PR URLs, token usage) at EOF. The
+controller reads Pod logs and extracts lines between the following markers:
 
 ```
 ---KELOS_OUTPUTS_START---
@@ -135,10 +136,10 @@ in Outputs but skipped when building Results.
 
 The `commit` and `base-branch` keys are captured by `kelos-capture`.
 Token usage and cost keys (`input-tokens`, `output-tokens`, `cost-usd`) are
-also extracted by `kelos-capture`, which reads the agent's JSON output from
-`/tmp/agent-output.jsonl` and uses `KELOS_AGENT_TYPE` to parse agent-specific
-formats. All agents emit `input-tokens` and `output-tokens`; `claude-code`
-additionally emits `cost-usd`.
+also extracted by `kelos-capture`, which consumes the agent's JSON output
+from stdin and uses `KELOS_AGENT_TYPE` to parse agent-specific formats. All
+agents emit `input-tokens` and `output-tokens`; `claude-code` additionally
+emits `cost-usd`.
 
 Results can be referenced in dependency prompt templates:
 
@@ -149,26 +150,28 @@ Results can be referenced in dependency prompt templates:
 The `/kelos/kelos-capture` binary is included in all reference images and handles
 this automatically. Custom images should either:
 
-1. Include the binary and call it after the agent exits, or
+1. Include the binary and pipe the agent's stdout through it, or
 2. Emit the markers directly from their entrypoint.
 
-The entrypoint must **not** use `exec` to run the agent, so that the capture
-step runs after the agent exits. Use the following pattern:
+The entrypoint must **not** use `exec` to run the agent, so that
+`kelos-capture` can emit markers after the agent exits. Use the following
+pattern:
 
 ```bash
-<agent> "${ARGS[@]}" | tee /tmp/agent-output.jsonl
+<agent> "${ARGS[@]}" | /kelos/kelos-capture
 AGENT_EXIT_CODE=${PIPESTATUS[0]}
-
-/kelos/kelos-capture
 
 exit $AGENT_EXIT_CODE
 ```
 
-The `tee` command copies the agent's stdout to `/tmp/agent-output.jsonl` so
-that `kelos-capture` can extract token usage or cost information.
-`PIPESTATUS[0]` captures the agent's exit code correctly with `set -uo pipefail`.
+`kelos-capture` forwards every line of the agent stream to its own stdout
+unchanged, so pod logs remain identical to the agent's raw output. It
+accumulates token usage in memory as the stream is read, so there is no
+on-disk copy of the stream and the pod does not need ephemeral storage for
+agent output. `PIPESTATUS[0]` captures the agent's exit code correctly with
+`set -uo pipefail`.
 
-Also use `set -uo pipefail` (without `-e`) so the capture script runs even if
+Also use `set -uo pipefail` (without `-e`) so the capture step runs even if
 the agent exits non-zero.
 
 ## Reference implementations

@@ -36,11 +36,14 @@ func TestCaptureOutputsFullFlow(t *testing.T) {
 		"git symbolic-ref refs/remotes/origin/HEAD": {output: "refs/remotes/origin/main"},
 	}}
 
-	usageFile := writeTempFile(t, `{"type":"result","total_cost_usd":0.05,"usage":{"input_tokens":1000,"output_tokens":500}}`)
-	t.Setenv("KELOS_AGENT_TYPE", "claude-code")
+	usage := map[string]string{
+		"cost-usd":      "0.05",
+		"input-tokens":  "1000",
+		"output-tokens": "500",
+	}
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, usageFile)
+	outputs := captureOutputs(r, usage)
 
 	expected := []string{
 		"branch: feature/test-branch",
@@ -65,9 +68,8 @@ func TestCaptureOutputsBaseBranchFromEnv(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "develop")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"branch: my-branch",
@@ -83,9 +85,8 @@ func TestCaptureOutputsNotGitRepo(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	if len(outputs) != 0 {
 		t.Errorf("expected no outputs outside git repo, got %v", outputs)
@@ -104,9 +105,8 @@ func TestCaptureOutputsMultiplePRs(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"branch: feature",
@@ -127,9 +127,8 @@ func TestCaptureOutputsDetachedHead(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"commit: abc123",
@@ -148,9 +147,8 @@ func TestCaptureOutputsGhFails(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"branch: branch",
@@ -171,9 +169,8 @@ func TestCaptureOutputsMarkers(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	if len(outputs) == 0 {
 		t.Fatal("expected non-empty outputs")
@@ -192,9 +189,8 @@ func TestCaptureOutputsNoMarkersWhenEmpty(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	if len(outputs) != 0 {
 		t.Errorf("expected empty outputs, got %v", outputs)
@@ -241,10 +237,9 @@ func TestCaptureOutputsWithUpstreamRepo(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 	t.Setenv("KELOS_UPSTREAM_REPO", "upstream-org/repo")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"branch: fix-branch",
@@ -271,10 +266,9 @@ func TestCaptureOutputsUpstreamRepoNoPRs(t *testing.T) {
 	}}
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
-	t.Setenv("KELOS_AGENT_TYPE", "")
 	t.Setenv("KELOS_UPSTREAM_REPO", "upstream-org/repo")
 
-	outputs := captureOutputs(r, "/nonexistent")
+	outputs := captureOutputs(r, nil)
 
 	expected := []string{
 		"branch: fix-branch",
