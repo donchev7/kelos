@@ -7,7 +7,6 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,29 +23,23 @@ import (
 )
 
 const (
-	enrichCallTimeout               = 5 * time.Second
-	postMessageTimeout              = 5 * time.Second
-	defaultSelfHandoffMaxPerThread  = 4
-	selfHandoffEnabledEnv           = "SLACK_SELF_HANDOFF_ENABLED"
-	selfHandoffMaxPerThreadEnv      = "SLACK_SELF_HANDOFF_MAX_PER_THREAD"
-	selfHandoffStopNoticeFormatText = "Auto-handoff stopped after %d Cody handoffs in this thread. Please continue manually if needed."
+	enrichCallTimeout  = 5 * time.Second
+	postMessageTimeout = 5 * time.Second
 )
 
 // SlackHandler handles Slack messages via Socket Mode and routes them to
 // matching TaskSpawners. It is the centralized equivalent of the per-TaskSpawner
 // SlackSource that previously ran in each spawner pod.
 type SlackHandler struct {
-	client                  client.Client
-	log                     logr.Logger
-	taskBuilder             *taskbuilder.TaskBuilder
-	api                     *goslack.Client
-	sm                      *socketmode.Client
-	botUserID               string
-	botID                   string
-	joinMessage             string
-	selfHandoffEnabled      bool
-	selfHandoffMaxPerThread int
-	cancel                  context.CancelFunc
+	client      client.Client
+	log         logr.Logger
+	taskBuilder *taskbuilder.TaskBuilder
+	api         *goslack.Client
+	sm          *socketmode.Client
+	botUserID   string
+	botID       string
+	joinMessage string
+	cancel      context.CancelFunc
 }
 
 // NewSlackHandler creates a new handler. Call Start to begin listening.
@@ -65,11 +58,6 @@ func NewSlackHandler(ctx context.Context, cl client.Client, botToken, appToken, 
 	}
 
 	log.Info("Authenticated with Slack", "botUserID", authResp.UserID, "botID", authResp.BotID)
-	selfHandoffEnabled := parseBoolEnv(os.Getenv(selfHandoffEnabledEnv))
-	selfHandoffMaxPerThread := parsePositiveIntEnv(os.Getenv(selfHandoffMaxPerThreadEnv), defaultSelfHandoffMaxPerThread)
-	if selfHandoffEnabled {
-		log.Info("Slack self-handoff enabled", "maxPerThread", selfHandoffMaxPerThread)
-	}
 
 	var joinMessage string
 	if joinMessageFile != "" {
@@ -84,16 +72,14 @@ func NewSlackHandler(ctx context.Context, cl client.Client, botToken, appToken, 
 	}
 
 	return &SlackHandler{
-		client:                  cl,
-		log:                     log,
-		taskBuilder:             tb,
-		api:                     api,
-		sm:                      newSocketModeClient(api),
-		botUserID:               authResp.UserID,
-		botID:                   authResp.BotID,
-		joinMessage:             joinMessage,
-		selfHandoffEnabled:      selfHandoffEnabled,
-		selfHandoffMaxPerThread: selfHandoffMaxPerThread,
+		client:      cl,
+		log:         log,
+		taskBuilder: tb,
+		api:         api,
+		sm:          newSocketModeClient(api),
+		botUserID:   authResp.UserID,
+		botID:       authResp.BotID,
+		joinMessage: joinMessage,
 	}, nil
 }
 
@@ -184,16 +170,6 @@ func (h *SlackHandler) handleMemberJoinedChannel(ctx context.Context, evt *slack
 func (h *SlackHandler) handleMessageEvent(ctx context.Context, innerEvent *slackevents.MessageEvent) {
 	hasContent := innerEvent.Text != "" ||
 		(innerEvent.Message != nil && len(innerEvent.Message.Attachments) > 0)
-	if h.handleSelfHandoffEvent(ctx, selfHandoffEvent{
-		UserID:    innerEvent.User,
-		BotID:     innerEvent.BotID,
-		Text:      innerEvent.Text,
-		ChannelID: innerEvent.Channel,
-		ThreadTS:  innerEvent.ThreadTimeStamp,
-		Timestamp: innerEvent.TimeStamp,
-	}, hasContent) {
-		return
-	}
 	if hasBotMention(innerEvent.Text, h.botUserID) {
 		h.log.V(1).Info("Message event with bot mention skipped; app_mention handles mention routing",
 			"user", innerEvent.User, "botID", innerEvent.BotID, "channel", innerEvent.Channel)
@@ -227,16 +203,6 @@ func (h *SlackHandler) handleMessageEvent(ctx context.Context, innerEvent *slack
 
 func (h *SlackHandler) handleAppMentionEvent(ctx context.Context, innerEvent *slackevents.AppMentionEvent) {
 	hasContent := innerEvent.Text != ""
-	if h.handleSelfHandoffEvent(ctx, selfHandoffEvent{
-		UserID:    innerEvent.User,
-		BotID:     innerEvent.BotID,
-		Text:      innerEvent.Text,
-		ChannelID: innerEvent.Channel,
-		ThreadTS:  innerEvent.ThreadTimeStamp,
-		Timestamp: innerEvent.TimeStamp,
-	}, hasContent) {
-		return
-	}
 	if !shouldProcess(innerEvent.User, "", hasContent, h.botUserID, innerEvent.BotID, h.botID) {
 		h.log.V(1).Info("App mention filtered by shouldProcess",
 			"user", innerEvent.User, "botID", innerEvent.BotID, "channel", innerEvent.Channel)
@@ -257,115 +223,6 @@ func (h *SlackHandler) handleAppMentionEvent(ctx context.Context, innerEvent *sl
 	}
 
 	h.routeMessage(ctx, msg)
-}
-
-type selfHandoffEvent struct {
-	UserID    string
-	BotID     string
-	Text      string
-	ChannelID string
-	ThreadTS  string
-	Timestamp string
-}
-
-func (h *SlackHandler) handleSelfHandoffEvent(ctx context.Context, event selfHandoffEvent, hasContent bool) bool {
-	if !h.selfHandoffEnabled {
-		return false
-	}
-	if !isSelfAuthoredSlackMessage(event.UserID, event.BotID, h.botUserID, h.botID) {
-		return false
-	}
-	if !hasContent {
-		h.log.V(1).Info("Self handoff ignored: message has no content", "channel", event.ChannelID)
-		return true
-	}
-	if h.api == nil {
-		h.log.V(1).Info("Self handoff ignored: Slack API client is not configured", "channel", event.ChannelID)
-		return true
-	}
-	if event.ThreadTS == "" {
-		h.log.V(1).Info("Self handoff ignored: message is not a thread reply", "channel", event.ChannelID)
-		return true
-	}
-
-	commands := extractSelfHandoffCommands(event.Text, h.botUserID)
-	if len(commands) != 1 {
-		h.log.V(1).Info("Self handoff ignored: expected exactly one handoff command",
-			"channel", event.ChannelID, "commandCount", len(commands))
-		return true
-	}
-	command := commands[0]
-
-	replies, err := FetchThreadReplies(ctx, h.api, event.ChannelID, event.ThreadTS)
-	if err != nil {
-		h.log.Error(err, "Self handoff ignored: failed to fetch thread context",
-			"channel", event.ChannelID, "threadTS", event.ThreadTS)
-		return true
-	}
-
-	priorCount, mostRecent := countPriorSelfHandoffCommands(replies, event.Timestamp, h.botUserID, h.botID)
-	if priorCount >= h.selfHandoffMaxPerThread {
-		h.log.Info("Self handoff stopped: max per thread reached",
-			"channel", event.ChannelID, "threadTS", event.ThreadTS, "priorCount", priorCount, "max", h.selfHandoffMaxPerThread)
-		h.postSelfHandoffStopNotice(ctx, event.ChannelID, event.ThreadTS, replies)
-		return true
-	}
-	if mostRecent == command.Normalized {
-		h.log.Info("Self handoff ignored: duplicate consecutive command",
-			"channel", event.ChannelID, "threadTS", event.ThreadTS, "command", command.Normalized)
-		return true
-	}
-
-	routeBotID := event.BotID
-	if routeBotID == "" {
-		routeBotID = h.botID
-	}
-	msg := &SlackMessageData{
-		UserID:           event.UserID,
-		ChannelID:        event.ChannelID,
-		UserName:         h.resolveUserName(ctx, event.UserID, routeBotID),
-		Text:             command.Normalized,
-		Body:             FormatThreadContext(replies, h.botUserID),
-		ThreadTS:         event.ThreadTS,
-		Timestamp:        event.Timestamp,
-		Permalink:        h.getPermalink(ctx, event.ChannelID, event.Timestamp),
-		HasThreadContext: true,
-		BotID:            routeBotID,
-		IsBotMessage:     true,
-	}
-
-	h.log.Info("Routing self handoff command",
-		"channel", event.ChannelID, "threadTS", event.ThreadTS, "target", command.Target, "priorCount", priorCount)
-	h.routeMessage(ctx, msg)
-	return true
-}
-
-// HandleReportedTerminalMessage evaluates a terminal Slack reporter message for
-// a Cody self-handoff. This covers final responses written by the reporter via
-// chat.update, which do not reliably arrive as ordinary new-message events.
-func (h *SlackHandler) HandleReportedTerminalMessage(ctx context.Context, msg reporting.SlackTerminalMessage) error {
-	h.handleSelfHandoffEvent(ctx, selfHandoffEvent{
-		UserID:    h.botUserID,
-		BotID:     h.botID,
-		Text:      msg.Text,
-		ChannelID: msg.ChannelID,
-		ThreadTS:  msg.ThreadTS,
-		Timestamp: msg.MessageTS,
-	}, strings.TrimSpace(msg.Text) != "")
-	return nil
-}
-
-func (h *SlackHandler) postSelfHandoffStopNotice(ctx context.Context, channelID, threadTS string, replies []goslack.Message) {
-	if threadHasSelfHandoffStopNotice(replies, h.botUserID, h.botID) {
-		return
-	}
-
-	text := fmt.Sprintf(selfHandoffStopNoticeFormatText, h.selfHandoffMaxPerThread)
-	postCtx, cancel := context.WithTimeout(ctx, postMessageTimeout)
-	defer cancel()
-	if _, _, err := h.api.PostMessageContext(postCtx, channelID, goslack.MsgOptionText(text, false), goslack.MsgOptionTS(threadTS)); err != nil {
-		h.log.Error(err, "Failed to post self handoff stop notice", "channel", channelID, "threadTS", threadTS)
-	}
 }
 
 func (h *SlackHandler) handleSlashCommand(ctx context.Context, evt socketmode.Event) {
@@ -647,23 +504,6 @@ func (h *SlackHandler) getPermalink(ctx context.Context, channel, ts string) str
 		return ""
 	}
 	return link
-}
-
-func parseBoolEnv(value string) bool {
-	value = strings.TrimSpace(strings.ToLower(value))
-	return value == "true" || value == "1" || value == "yes"
-}
-
-func parsePositiveIntEnv(value string, fallback int) int {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return fallback
-	}
-	return parsed
 }
 
 // newSocketModeClient creates a Socket Mode client with an stderr logger.
