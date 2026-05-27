@@ -107,9 +107,6 @@ slackServer:
   image: ghcr.io/kelos-dev/kelos-slack-server
   replicas: 1
   secretName: ""
-  selfHandoff:
-    enabled: false
-    maxPerThread: 4
   # Message posted when the bot joins a channel. Leave empty to disable.
   joinMessage: ""
   resources:
