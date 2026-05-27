@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/source"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1630,6 +1631,51 @@ func TestBuildCronJob_BackoffLimit(t *testing.T) {
 	// Backoff limit should be 0 (no retries for one-shot)
 	if cronJob.Spec.JobTemplate.Spec.BackoffLimit == nil || *cronJob.Spec.JobTemplate.Spec.BackoffLimit != 0 {
 		t.Errorf("expected BackoffLimit=0, got %v", cronJob.Spec.JobTemplate.Spec.BackoffLimit)
+	}
+}
+
+func TestBuildCronJob_AikidoScheduleAndToolsClientLabel(t *testing.T) {
+	builder := NewDeploymentBuilder()
+	ts := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aikido-spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Aikido: &kelosv1alpha1.Aikido{
+					Schedule: "0 6 * * *",
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "codex",
+			},
+		},
+	}
+
+	cronJob := builder.BuildCronJob(ts, nil, false)
+
+	if cronJob.Spec.Schedule != "0 6 * * *" {
+		t.Errorf("expected schedule %q, got %q", "0 6 * * *", cronJob.Spec.Schedule)
+	}
+	labels := cronJob.Spec.JobTemplate.Spec.Template.Labels
+	if labels["cody.alpheya.com/tools-client"] != "true" {
+		t.Errorf("expected tools-client label, got labels %v", labels)
+	}
+	args := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Args
+	wantArg := "--aikido-proxy-url=" + source.DefaultAikidoProxyURL
+	found := false
+	for _, arg := range args {
+		if arg == wantArg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected %q in args %v", wantArg, args)
+	}
+	if !isScheduledSource(ts) {
+		t.Error("Expected isScheduledSource to return true for Aikido TaskSpawner")
 	}
 }
 

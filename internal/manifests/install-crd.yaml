@@ -12676,6 +12676,38 @@ spec:
               when:
                 description: When defines the conditions that trigger task spawning.
                 properties:
+                  aikido:
+                    description: Aikido discovers security issue groups from Aikido
+                      on a schedule.
+                    properties:
+                      repositories:
+                        description: |-
+                          Repositories filters by exact Aikido code repository name. When empty,
+                          discovery is account-wide for code-repository issue groups.
+                        items:
+                          type: string
+                        maxItems: 25
+                        type: array
+                      schedule:
+                        description: Schedule is a cron expression for Aikido discovery.
+                        type: string
+                      severities:
+                        description: Severities filters by Aikido severity. When empty,
+                          all severities match.
+                        items:
+                          type: string
+                        maxItems: 4
+                        type: array
+                      statuses:
+                        description: Statuses filters by Aikido issue group status.
+                          Defaults to ["open"].
+                        items:
+                          type: string
+                        maxItems: 4
+                        type: array
+                    required:
+                    - schedule
+                    type: object
                   cron:
                     description: Cron triggers task spawning on a cron schedule.
                     properties:

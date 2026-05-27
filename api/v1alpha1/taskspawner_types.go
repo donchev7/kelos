@@ -33,6 +33,10 @@ type When struct {
 	// +optional
 	Cron *Cron `json:"cron,omitempty"`
 
+	// Aikido discovers security issue groups from Aikido on a schedule.
+	// +optional
+	Aikido *Aikido `json:"aikido,omitempty"`
+
 	// Jira discovers issues from a Jira project.
 	// +optional
 	Jira *Jira `json:"jira,omitempty"`
@@ -64,6 +68,31 @@ type Cron struct {
 	// Schedule is a cron expression (e.g., "0 9 * * 1" for every Monday at 9am).
 	// +kubebuilder:validation:Required
 	Schedule string `json:"schedule"`
+}
+
+// Aikido discovers security issue groups from Aikido on a cron schedule.
+type Aikido struct {
+	// Schedule is a cron expression for Aikido discovery.
+	// +kubebuilder:validation:Required
+	Schedule string `json:"schedule"`
+
+	// Repositories filters by exact Aikido code repository name. When empty,
+	// discovery is account-wide for code-repository issue groups.
+	// +optional
+	// +kubebuilder:validation:MaxItems=25
+	Repositories []string `json:"repositories,omitempty"`
+
+	// Statuses filters by Aikido issue group status. Defaults to ["open"].
+	// +optional
+	// +kubebuilder:validation:Items:Enum=open;closed;snoozed;ignored
+	// +kubebuilder:validation:MaxItems=4
+	Statuses []string `json:"statuses,omitempty"`
+
+	// Severities filters by Aikido severity. When empty, all severities match.
+	// +optional
+	// +kubebuilder:validation:Items:Enum=critical;high;medium;low
+	// +kubebuilder:validation:MaxItems=4
+	Severities []string `json:"severities,omitempty"`
 }
 
 // GitHubReporting configures status reporting back to GitHub.

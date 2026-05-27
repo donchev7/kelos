@@ -17,6 +17,9 @@ type WorkItem struct {
 	Comments string
 	Kind     string // "Issue" or "PR"
 	Branch   string
+	// Metadata contains source-provided machine-readable values. The spawner
+	// copies these to spawned Task annotations after template metadata renders.
+	Metadata map[string]string
 	// ReviewState is the aggregated pull request review state for GitHub PR sources.
 	ReviewState string
 	// ReviewComments contains formatted inline review comments for GitHub PR sources.

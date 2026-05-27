@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/source"
 )
 
 const (
@@ -186,6 +187,11 @@ func (b *DeploymentBuilder) buildPodParts(ts *kelosv1alpha1.TaskSpawner, workspa
 		"kelos.dev/taskspawner": ts.Name,
 	}
 
+	if ts.Spec.When.Aikido != nil {
+		args = append(args, "--aikido-proxy-url="+source.DefaultAikidoProxyURL)
+		labels["cody.alpheya.com/tools-client"] = "true"
+	}
+
 	return spawnerPodParts{
 		args:    args,
 		envVars: envVars,
@@ -282,7 +288,7 @@ func (b *DeploymentBuilder) BuildCronJob(ts *kelosv1alpha1.TaskSpawner, workspac
 			Labels:    p.labels,
 		},
 		Spec: batchv1.CronJobSpec{
-			Schedule:                   ts.Spec.When.Cron.Schedule,
+			Schedule:                   taskSpawnerSchedule(ts),
 			ConcurrencyPolicy:          batchv1.ForbidConcurrent,
 			SuccessfulJobsHistoryLimit: &successfulJobsHistoryLimit,
 			FailedJobsHistoryLimit:     &failedJobsHistoryLimit,

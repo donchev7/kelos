@@ -45,6 +45,7 @@ func WorkItemToTemplateVars(item WorkItem) map[string]interface{} {
 		"Comments":       item.Comments,
 		"Kind":           kind,
 		"Branch":         item.Branch,
+		"Metadata":       item.Metadata,
 		"ReviewState":    item.ReviewState,
 		"ReviewComments": item.ReviewComments,
 		"Time":           item.Time,
@@ -59,6 +60,7 @@ func WorkItemToTemplateVars(item WorkItem) map[string]interface{} {
 // Available variables (all sources): {{.ID}}, {{.Title}}, {{.Kind}}
 // GitHub issue/Jira sources: {{.Number}}, {{.Body}}, {{.URL}}, {{.Labels}}, {{.Comments}}
 // GitHub pull request sources additionally expose: {{.Branch}}, {{.ReviewState}}, {{.ReviewComments}}
+// Source metadata is exposed as {{ index .Metadata "key" }}.
 // Cron sources: {{.Time}}, {{.Schedule}}
 func RenderTemplate(tmplStr string, item WorkItem) (string, error) {
 	tmpl, err := template.New("tmpl").Parse(tmplStr)
@@ -81,6 +83,7 @@ func RenderTemplate(tmplStr string, item WorkItem) (string, error) {
 		Comments       string
 		Kind           string
 		Branch         string
+		Metadata       map[string]string
 		ReviewState    string
 		ReviewComments string
 		Time           string
@@ -95,6 +98,7 @@ func RenderTemplate(tmplStr string, item WorkItem) (string, error) {
 		Comments:       item.Comments,
 		Kind:           kind,
 		Branch:         item.Branch,
+		Metadata:       item.Metadata,
 		ReviewState:    item.ReviewState,
 		ReviewComments: item.ReviewComments,
 		Time:           item.Time,
