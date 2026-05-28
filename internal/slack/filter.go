@@ -32,10 +32,6 @@ type SlackMessageData struct {
 	// HasThreadContext indicates that Body contains full thread context
 	// rather than the raw message text.
 	HasThreadContext bool
-	// BotID is the Slack bot ID when the message author is a bot.
-	BotID string
-	// IsBotMessage indicates this came from a bot-authored Slack event.
-	IsBotMessage bool
 	// IsSlashCommand indicates this came from a slash command rather than a message event.
 	IsSlashCommand bool
 	// SlashCommandID is the composite ID for slash commands (channelID:command:triggerID).
@@ -79,9 +75,6 @@ func MatchesSpawner(slackCfg *v1alpha1.Slack, msg *SlackMessageData, botUserID s
 	// Slash commands bypass mention, trigger, and exclude filters.
 	if msg.IsSlashCommand {
 		return true
-	}
-	if msg.IsBotMessage {
-		return false
 	}
 	var positiveMatch bool
 	if len(slackCfg.Triggers) == 0 {
@@ -145,12 +138,6 @@ func hasBotMention(text string, botUserID string) bool {
 		strings.Contains(text, fmt.Sprintf("<@%s|", botUserID))
 }
 
-// HasBotMention returns true if the message text contains an @-mention of the
-// bot user ID.
-func HasBotMention(text string, botUserID string) bool {
-	return hasBotMention(text, botUserID)
-}
-
 // stripLeadingMentions removes Slack mention tokens (<@USERID> or
 // <@USERID|display-name>) from the beginning of text so that trigger
 // and exclude pattern matching targets semantic content.
@@ -167,11 +154,6 @@ func stripLeadingMentions(text string) string {
 		}
 		s = s[end+1:]
 	}
-}
-
-// StripLeadingMentions removes Slack mention tokens from the beginning of text.
-func StripLeadingMentions(text string) string {
-	return stripLeadingMentions(text)
 }
 
 // matchesExcludePatterns returns true if the message text matches any of

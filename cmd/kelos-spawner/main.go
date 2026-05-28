@@ -53,7 +53,6 @@ func main() {
 	var jiraBaseURL string
 	var jiraProject string
 	var jiraJQL string
-	var aikidoProxyURL string
 	var oneShot bool
 
 	flag.StringVar(&name, "taskspawner-name", "", "Name of the TaskSpawner to manage")
@@ -69,7 +68,6 @@ func main() {
 	flag.StringVar(&jiraBaseURL, "jira-base-url", "", "Jira instance base URL (e.g. https://mycompany.atlassian.net)")
 	flag.StringVar(&jiraProject, "jira-project", "", "Jira project key")
 	flag.StringVar(&jiraJQL, "jira-jql", "", "Optional JQL filter for Jira issues")
-	flag.StringVar(&aikidoProxyURL, "aikido-proxy-url", "", "cody-tools Aikido proxy base URL (env: KELOS_AIKIDO_PROXY_URL)")
 	flag.BoolVar(&oneShot, "one-shot", false, "Run a single discovery cycle and exit (used by CronJob)")
 
 	opts, applyVerbosity := logging.SetupZapOptions(flag.CommandLine)
@@ -96,12 +94,6 @@ func main() {
 	}
 	if githubAppPrivateKey == "" {
 		githubAppPrivateKey = os.Getenv("GITHUB_APP_PRIVATE_KEY")
-	}
-	if aikidoProxyURL == "" {
-		aikidoProxyURL = os.Getenv("KELOS_AIKIDO_PROXY_URL")
-	}
-	if aikidoProxyURL == "" {
-		aikidoProxyURL = source.DefaultAikidoProxyURL
 	}
 
 	if name == "" || namespace == "" {
@@ -139,7 +131,6 @@ func main() {
 		JiraBaseURL:      jiraBaseURL,
 		JiraProject:      jiraProject,
 		JiraJQL:          jiraJQL,
-		AikidoProxyURL:   aikidoProxyURL,
 		HTTPClient:       httpClient,
 	}
 
@@ -208,12 +199,8 @@ func runCycle(ctx context.Context, cl client.Client, key types.NamespacedName, g
 }
 
 func runCycleWithProxy(ctx context.Context, cl client.Client, key types.NamespacedName, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL string, httpClient *http.Client) error {
-	return runCycleWithProxyAndAikido(ctx, cl, key, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, source.DefaultAikidoProxyURL, httpClient)
-}
-
-func runCycleWithProxyAndAikido(ctx context.Context, cl client.Client, key types.NamespacedName, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL, aikidoProxyURL string, httpClient *http.Client) error {
 	start := time.Now()
-	err := runCycleCore(ctx, cl, key, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, aikidoProxyURL, httpClient)
+	err := runCycleCore(ctx, cl, key, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, httpClient)
 	discoveryDurationSeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		discoveryErrorsTotal.Inc()
@@ -221,13 +208,13 @@ func runCycleWithProxyAndAikido(ctx context.Context, cl client.Client, key types
 	return err
 }
 
-func runCycleCore(ctx context.Context, cl client.Client, key types.NamespacedName, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL, aikidoProxyURL string, httpClient *http.Client) error {
+func runCycleCore(ctx context.Context, cl client.Client, key types.NamespacedName, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL string, httpClient *http.Client) error {
 	var ts kelosv1alpha1.TaskSpawner
 	if err := cl.Get(ctx, key, &ts); err != nil {
 		return fmt.Errorf("fetching TaskSpawner: %w", err)
 	}
 
-	src, err := buildSourceWithProxyAndAikido(ctx, &ts, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, aikidoProxyURL, httpClient)
+	src, err := buildSourceWithProxy(ctx, &ts, githubOwner, githubRepo, ghProxyURL, githubAPIBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, httpClient)
 	if err != nil {
 		return fmt.Errorf("building source: %w", err)
 	}
@@ -504,21 +491,12 @@ func runCycleWithSourceCore(ctx context.Context, cl client.Client, key types.Nam
 	return nil
 }
 
-// sourceAnnotations returns source-owned annotations for a spawned Task.
-// WorkItem metadata is copied first so every source can expose stable
-// machine-readable identifiers. Source-specific annotations are applied after
-// template metadata and therefore win on conflicts.
+// sourceAnnotations returns annotations that stamp GitHub source metadata
+// onto a spawned Task. These annotations enable downstream consumers (such
+// as the reporting watcher) to identify the originating issue or PR.
 func sourceAnnotations(ts *kelosv1alpha1.TaskSpawner, item source.WorkItem) map[string]string {
-	annotations := make(map[string]string, len(item.Metadata)+4)
-	for k, v := range item.Metadata {
-		annotations[k] = v
-	}
-
 	if ts.Spec.When.GitHubIssues == nil && ts.Spec.When.GitHubPullRequests == nil {
-		if len(annotations) == 0 {
-			return nil
-		}
-		return annotations
+		return nil
 	}
 
 	kind := "issue"
@@ -526,8 +504,10 @@ func sourceAnnotations(ts *kelosv1alpha1.TaskSpawner, item source.WorkItem) map[
 		kind = "pull-request"
 	}
 
-	annotations[reporting.AnnotationSourceKind] = kind
-	annotations[reporting.AnnotationSourceNumber] = strconv.Itoa(item.Number)
+	annotations := map[string]string{
+		reporting.AnnotationSourceKind:   kind,
+		reporting.AnnotationSourceNumber: strconv.Itoa(item.Number),
+	}
 
 	if reportingEnabled(ts) {
 		annotations[reporting.AnnotationGitHubReporting] = "enabled"
@@ -625,10 +605,6 @@ func buildSource(ctx context.Context, ts *kelosv1alpha1.TaskSpawner, owner, repo
 }
 
 func buildSourceWithProxy(ctx context.Context, ts *kelosv1alpha1.TaskSpawner, owner, repo, ghProxyURL, apiBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL string, httpClient *http.Client) (source.Source, error) {
-	return buildSourceWithProxyAndAikido(ctx, ts, owner, repo, ghProxyURL, apiBaseURL, tokenResolver, jiraBaseURL, jiraProject, jiraJQL, source.DefaultAikidoProxyURL, httpClient)
-}
-
-func buildSourceWithProxyAndAikido(ctx context.Context, ts *kelosv1alpha1.TaskSpawner, owner, repo, ghProxyURL, apiBaseURL string, tokenResolver func(context.Context) (string, error), jiraBaseURL, jiraProject, jiraJQL, aikidoProxyURL string, httpClient *http.Client) (source.Source, error) {
 	if ts.Spec.When.GitHubIssues != nil {
 		gh := ts.Spec.When.GitHubIssues
 		commentPolicy, err := resolveGitHubCommentPolicy(gh.CommentPolicy, gh.TriggerComment, gh.ExcludeComments)
@@ -734,17 +710,6 @@ func buildSourceWithProxyAndAikido(ctx context.Context, ts *kelosv1alpha1.TaskSp
 		return &source.CronSource{
 			Schedule:          ts.Spec.When.Cron.Schedule,
 			LastDiscoveryTime: lastDiscovery,
-		}, nil
-	}
-
-	if ts.Spec.When.Aikido != nil {
-		aikido := ts.Spec.When.Aikido
-		return &source.AikidoSource{
-			ProxyBaseURL: aikidoProxyURL,
-			Repositories: aikido.Repositories,
-			Statuses:     aikido.Statuses,
-			Severities:   aikido.Severities,
-			Client:       httpClient,
 		}, nil
 	}
 

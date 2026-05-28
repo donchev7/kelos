@@ -272,20 +272,6 @@ func TestMatchesSpawner(t *testing.T) {
 			botUserID: "UBOT1",
 			want:      true,
 		},
-		{
-			name:      "bot message rejected",
-			slackCfg:  &v1alpha1.Slack{},
-			msg:       &SlackMessageData{BotID: "BTRUSTED1", IsBotMessage: true, ChannelID: "C1", Text: "<@UBOT1> fix the login page"},
-			botUserID: "UBOT1",
-			want:      false,
-		},
-		{
-			name:      "bot message rejected even with bot id",
-			slackCfg:  &v1alpha1.Slack{},
-			msg:       &SlackMessageData{BotID: "BTRUSTED1", IsBotMessage: true, ChannelID: "C1", Text: "<@UBOT1> fix the login page"},
-			botUserID: "UBOT1",
-			want:      false,
-		},
 	}
 
 	for _, tt := range tests {
@@ -369,7 +355,6 @@ func TestShouldProcess(t *testing.T) {
 		subtype    string
 		hasContent bool
 		selfUserID string
-		botID      string
 		want       bool
 	}{
 		{
@@ -387,27 +372,9 @@ func TestShouldProcess(t *testing.T) {
 			want:       false,
 		},
 		{
-			name:       "bot_message subtype with bot id filtered",
+			name:       "bot_message subtype filtered",
 			userID:     "U1",
 			subtype:    "bot_message",
-			botID:      "BTRUSTED1",
-			hasContent: true,
-			selfUserID: "UBOT",
-			want:       false,
-		},
-		{
-			name:       "bot_message subtype without bot id filtered",
-			userID:     "U1",
-			subtype:    "bot_message",
-			hasContent: true,
-			selfUserID: "UBOT",
-			want:       false,
-		},
-		{
-			name:       "self bot message filtered",
-			userID:     "U1",
-			subtype:    "bot_message",
-			botID:      "BCODY",
 			hasContent: true,
 			selfUserID: "UBOT",
 			want:       false,
@@ -447,7 +414,7 @@ func TestShouldProcess(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldProcess(tt.userID, tt.subtype, tt.hasContent, tt.selfUserID, tt.botID)
+			got := shouldProcess(tt.userID, tt.subtype, tt.hasContent, tt.selfUserID)
 			if got != tt.want {
 				t.Errorf("shouldProcess() = %v, want %v", got, tt.want)
 			}

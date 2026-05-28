@@ -12,13 +12,6 @@ set -uo pipefail
 
 PROMPT="${1:?Prompt argument is required}"
 
-# Optional pre-agent setup. No-op unless the matching env vars are
-# present: CODY_TOOLS_GITHUB_BASE_URL for git push via cody-tools brokered
-# GitHub App installation tokens and a mounted ServiceAccount token for
-# kubectl. Tasks that don't need either pay no cost; tasks that do get a
-# configured git credential helper and ~/.kube/config before the agent runs.
-/usr/local/bin/kelos-agent-setup
-
 # Write auth.json from env var for OAuth/ChatGPT credential flow.
 # Strip control characters so serde_json's strict parser accepts
 # the file (the env var value may contain raw newlines).
@@ -44,15 +37,11 @@ if [ -n "${KELOS_AGENTS_MD:-}" ]; then
   printf '%s' "$KELOS_AGENTS_MD" >~/.codex/AGENTS.md
 fi
 
-# Install each plugin as a Codex skill directory under ~/.codex/skills.
-# Codex CLI 0.130.0 does not accept `--enable skills` (the feature-flag
-# name is rejected as unknown), so the skill files land on disk but are
-# not surfaced to the agent. Until we bump CODEX_VERSION to a release
-# that supports skills, AgentConfigs should put the load-bearing
-# guidance in agentsMD (which becomes ~/.codex/AGENTS.md and IS read).
+# Install each plugin as a Codex skill directory under ~/.codex/skills
 if [ -n "${KELOS_PLUGIN_DIR:-}" ] && [ -d "${KELOS_PLUGIN_DIR}" ]; then
   for plugindir in "${KELOS_PLUGIN_DIR}"/*/; do
     [ -d "$plugindir" ] || continue
+    # Copy skills into ~/.codex/skills/<plugin>/<skill>/SKILL.md
     if [ -d "${plugindir}skills" ]; then
       for skilldir in "${plugindir}skills"/*/; do
         [ -d "$skilldir" ] || continue

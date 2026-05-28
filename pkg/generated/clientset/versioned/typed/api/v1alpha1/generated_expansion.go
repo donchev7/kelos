@@ -20,10 +20,6 @@ package v1alpha1
 
 type AgentConfigExpansion interface{}
 
-type AgentSessionExpansion interface{}
-
-type AgentTurnExpansion interface{}
-
 type TaskExpansion interface{}
 
 type TaskSpawnerExpansion interface{}

@@ -277,47 +277,6 @@ func TestBuildSource_Jira(t *testing.T) {
 	}
 }
 
-func TestBuildSource_Aikido(t *testing.T) {
-	ts := &kelosv1alpha1.TaskSpawner{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "spawner",
-			Namespace: "default",
-		},
-		Spec: kelosv1alpha1.TaskSpawnerSpec{
-			When: kelosv1alpha1.When{
-				Aikido: &kelosv1alpha1.Aikido{
-					Schedule:     "0 6 * * *",
-					Repositories: []string{"notification-service"},
-					Statuses:     []string{"open"},
-					Severities:   []string{"critical", "high"},
-				},
-			},
-			TaskTemplate: kelosv1alpha1.TaskTemplate{
-				Type: "codex",
-			},
-		},
-	}
-
-	src, err := buildSourceWithProxyAndAikido(context.Background(), ts, "", "", "", "", noToken, "", "", "", "http://cody-tools/aikido", nil)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	aikidoSrc, ok := src.(*source.AikidoSource)
-	if !ok {
-		t.Fatalf("Expected *source.AikidoSource, got %T", src)
-	}
-	if aikidoSrc.ProxyBaseURL != "http://cody-tools/aikido" {
-		t.Errorf("ProxyBaseURL = %q", aikidoSrc.ProxyBaseURL)
-	}
-	if len(aikidoSrc.Repositories) != 1 || aikidoSrc.Repositories[0] != "notification-service" {
-		t.Errorf("Repositories = %v", aikidoSrc.Repositories)
-	}
-	if len(aikidoSrc.Severities) != 2 || aikidoSrc.Severities[1] != "high" {
-		t.Errorf("Severities = %v", aikidoSrc.Severities)
-	}
-}
-
 func TestRunCycleWithSource_NoMaxConcurrency(t *testing.T) {
 	ts := newTaskSpawner("spawner", "default", nil)
 	cl, key := setupTest(t, ts)
@@ -2021,57 +1980,6 @@ func TestRunCycleWithSource_TaskTemplateMetadataLabelsAndAnnotations(t *testing.
 	}
 	if task.Annotations[reporting.AnnotationSourceKind] != "issue" {
 		t.Errorf("Expected source-kind from GitHub source, got %q", task.Annotations[reporting.AnnotationSourceKind])
-	}
-}
-
-func TestRunCycleWithSource_SourceMetadataAnnotations(t *testing.T) {
-	ts := newTaskSpawner("spawner", "default", nil)
-	ts.Spec.When = kelosv1alpha1.When{
-		Aikido: &kelosv1alpha1.Aikido{Schedule: "0 6 * * *"},
-	}
-	ts.Spec.TaskTemplate.WorkspaceRef = nil
-	ts.Spec.TaskTemplate.Metadata = &kelosv1alpha1.TaskTemplateMetadata{
-		Labels: map[string]string{
-			"cody.alpheya.com/aikido-severity": `{{ index .Metadata "aikido.kelos.dev/severity" }}`,
-		},
-		Annotations: map[string]string{
-			source.AikidoMetadataIssueGroupID: "wrong",
-		},
-	}
-	cl, key := setupTest(t, ts)
-
-	src := &fakeSource{
-		items: []source.WorkItem{
-			{
-				ID:     "aikido-group-123",
-				Number: 123,
-				Title:  "Aikido issue",
-				Kind:   "AikidoIssueGroup",
-				Metadata: map[string]string{
-					source.AikidoMetadataIssueGroupID: "123",
-					source.AikidoMetadataSeverity:     "critical",
-				},
-			},
-		},
-	}
-
-	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	var task kelosv1alpha1.Task
-	if err := cl.Get(context.Background(), types.NamespacedName{Name: "spawner-aikido-group-123", Namespace: "default"}, &task); err != nil {
-		t.Fatalf("Failed to get created task: %v", err)
-	}
-
-	if task.Labels["cody.alpheya.com/aikido-severity"] != "critical" {
-		t.Errorf("metadata label = %q, want critical", task.Labels["cody.alpheya.com/aikido-severity"])
-	}
-	if task.Annotations[source.AikidoMetadataIssueGroupID] != "123" {
-		t.Errorf("source metadata annotation should win, got %q", task.Annotations[source.AikidoMetadataIssueGroupID])
-	}
-	if task.Annotations[source.AikidoMetadataSeverity] != "critical" {
-		t.Errorf("source severity annotation = %q, want critical", task.Annotations[source.AikidoMetadataSeverity])
 	}
 }
 
