@@ -1,0 +1,231 @@
+package source
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestAikidoDiscoverBuildsQueriesFiltersSeverityAndMapsMetadata(t *testing.T) {
+	var issueGroupQuery urlValues
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/aikido/repositories/code":
+			if got := r.URL.Query().Get("filter_name"); got != "notification-service" {
+				t.Errorf("filter_name = %q, want notification-service", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{"name": "notification-service", "active": true}},
+			})
+		case "/aikido/open-issue-groups":
+			issueGroupQuery = urlValues(r.URL.Query())
+			if r.URL.Query().Get("filter_issue_type") != "" {
+				t.Errorf("filter_issue_type should not be sent, got %q", r.URL.Query().Get("filter_issue_type"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{
+					{
+						"id":                   123,
+						"title":                "Upgrade vulnerable package",
+						"description":          "lodash vulnerable",
+						"severity":             "high",
+						"status":               "open",
+						"issue_type":           "open_source",
+						"code_repository_name": "notification-service",
+						"package_name":         "lodash",
+						"fixed_version":        "4.17.21",
+						"url":                  "https://app.aikido.dev/issues/groups/123",
+					},
+					{
+						"id":                   124,
+						"title":                "Low severity issue",
+						"severity":             "low",
+						"status":               "open",
+						"issue_type":           "sast",
+						"code_repository_name": "notification-service",
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{
+		ProxyBaseURL: server.URL + "/aikido",
+		Repositories: []string{"notification-service"},
+		Statuses:     []string{"open"},
+		Severities:   []string{"high"},
+	}
+
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	if issueGroupQuery.Get("filter_code_repo_name") != "notification-service" {
+		t.Errorf("filter_code_repo_name = %q", issueGroupQuery.Get("filter_code_repo_name"))
+	}
+	if issueGroupQuery.Get("filter_status") != "open" {
+		t.Errorf("filter_status = %q", issueGroupQuery.Get("filter_status"))
+	}
+
+	item := items[0]
+	if item.ID != "aikido-group-123" {
+		t.Errorf("ID = %q", item.ID)
+	}
+	if item.Kind != "AikidoIssueGroup" {
+		t.Errorf("Kind = %q", item.Kind)
+	}
+	if item.Metadata[AikidoMetadataIssueGroupID] != "123" {
+		t.Errorf("issue group metadata = %q", item.Metadata[AikidoMetadataIssueGroupID])
+	}
+	if item.Metadata[AikidoMetadataSeverity] != "high" {
+		t.Errorf("severity metadata = %q", item.Metadata[AikidoMetadataSeverity])
+	}
+	if item.Metadata[AikidoMetadataRepositories] != "notification-service" {
+		t.Errorf("repositories metadata = %q", item.Metadata[AikidoMetadataRepositories])
+	}
+	if !strings.Contains(item.Body, "Fixed version: 4.17.21") {
+		t.Errorf("Body missing fixed version hint:\n%s", item.Body)
+	}
+}
+
+func TestAikidoDiscoverDefaultsStatusToOpen(t *testing.T) {
+	var status string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-issue-groups":
+			status = r.URL.Query().Get("filter_status")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{ProxyBaseURL: server.URL}
+	if _, err := s.Discover(context.Background()); err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if status != "open" {
+		t.Errorf("filter_status = %q, want open", status)
+	}
+}
+
+func TestAikidoDiscoverRepositoryValidationFailsOnNoExactMatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"name": "notification-service-old", "active": true}},
+		})
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{
+		ProxyBaseURL: server.URL,
+		Repositories: []string{"notification-service"},
+	}
+
+	_, err := s.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("Discover() error = %v, want repository not found", err)
+	}
+}
+
+func TestAikidoDiscoverDeduplicatesIssueGroups(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/open-issue-groups" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":         "abc",
+			"title":      "Shared issue",
+			"severity":   "critical",
+			"status":     r.URL.Query().Get("filter_status"),
+			"issue_type": "sast",
+		}})
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{
+		ProxyBaseURL: server.URL,
+		Statuses:     []string{"open", "snoozed"},
+	}
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+}
+
+func TestAikidoDiscoverErrorsOnMissingIssueGroupID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/open-issue-groups" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"title": "No ID", "severity": "high"}})
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{ProxyBaseURL: server.URL}
+	_, err := s.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "missing issue group ID") {
+		t.Fatalf("Discover() error = %v, want missing issue group ID", err)
+	}
+}
+
+func TestAikidoDiscoverRedactsLeakedSecretBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/open-issue-groups" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":          "secret-1",
+			"title":       "Leaked secret",
+			"description": "token=ghp_abcdefghijklmnopqrstuvwxyz123456",
+			"severity":    "critical",
+			"status":      "open",
+			"issue_type":  "leaked_secret",
+		}})
+	}))
+	defer server.Close()
+
+	s := &AikidoSource{ProxyBaseURL: server.URL}
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if strings.Contains(items[0].Body, "ghp_abcdefghijklmnopqrstuvwxyz123456") {
+		t.Fatalf("Body leaked secret: %s", items[0].Body)
+	}
+}
+
+func TestAikidoWorkItemIDShortensLongIDs(t *testing.T) {
+	id := aikidoWorkItemID("550e8400-e29b-41d4-a716-446655440000")
+	if len(id) > 30 {
+		t.Fatalf("len(id) = %d, want <= 30: %s", len(id), id)
+	}
+	if !strings.HasPrefix(id, "aikido-group-550e8400-") {
+		t.Fatalf("ID = %q, want stable shortened Aikido group ID", id)
+	}
+}
+
+type urlValues map[string][]string
+
+func (v urlValues) Get(key string) string {
+	if values := v[key]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
