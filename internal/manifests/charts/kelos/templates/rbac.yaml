@@ -94,8 +94,6 @@ rules:
 - apiGroups:
   - kelos.dev
   resources:
-  - agentsessions
-  - agentturns
   - tasks
   - taskspawners
   verbs:
@@ -109,7 +107,6 @@ rules:
 - apiGroups:
   - kelos.dev
   resources:
-  - agentsessions/finalizers
   - tasks/finalizers
   - taskspawners/finalizers
   verbs:
@@ -117,8 +114,6 @@ rules:
 - apiGroups:
   - kelos.dev
   resources:
-  - agentsessions/status
-  - agentturns/status
   - tasks/status
   - taskspawners/status
   verbs:
@@ -317,28 +312,6 @@ rules:
       - create
       - get
       - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - kelos.dev
-    resources:
-      - agentsessions
-      - agentturns
-    verbs:
-      - create
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - kelos.dev
-    resources:
-      - agentsessions/status
-      - agentturns/status
-    verbs:
-      - get
-      - patch
-      - update
   - apiGroups:
       - kelos.dev
     resources:
@@ -360,20 +333,6 @@ rules:
       - patch
       - update
       - watch
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - pods/log
-    verbs:
-      - get
   - apiGroups:
       - ""
     resources:

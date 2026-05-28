@@ -26,11 +26,11 @@ const (
 // that no on-disk copy of the stream is required.
 func Run() int {
 	agentType := os.Getenv("KELOS_AGENT_TYPE")
-	stream, err := streamAgentOutput(agentType, os.Stdin, os.Stdout)
+	usage, response, err := Stream(agentType, os.Stdin, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kelos-capture: error reading agent output: %v\n", err)
 	}
-	outputs := captureOutputsWithResponse(realRunner{}, stream.usage, stream.response)
+	outputs := captureOutputs(realRunner{}, usage, response)
 	if len(outputs) == 0 {
 		return 0
 	}
@@ -60,11 +60,7 @@ func (realRunner) run(name string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), err
 }
 
-func captureOutputs(r runner, usage map[string]string) []string {
-	return captureOutputsWithResponse(r, usage, "")
-}
-
-func captureOutputsWithResponse(r runner, usage map[string]string, response string) []string {
+func captureOutputs(r runner, usage map[string]string, response string) []string {
 	var outputs []string
 
 	inGitRepo := isGitRepo(r)
@@ -100,11 +96,6 @@ func captureOutputsWithResponse(r runner, usage map[string]string, response stri
 		}
 	}
 
-	// Emit the agent's visible response text so reporters (Slack thread
-	// replies, GitHub PR comments) can surface the answer to the user
-	// instead of only the task title and token counts. Base64-encoded
-	// because the text may span multiple lines, which would otherwise
-	// break the line-delimited KELOS_OUTPUTS contract.
 	if response != "" {
 		outputs = append(outputs, "response: "+base64.StdEncoding.EncodeToString([]byte(response)))
 	}

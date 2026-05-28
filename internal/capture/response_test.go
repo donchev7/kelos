@@ -160,8 +160,8 @@ func TestParseResponseEmptyFile(t *testing.T) {
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agent-output.jsonl")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatal(err)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing temp file: %v", err)
 	}
 	return path
 }

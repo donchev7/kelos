@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -43,7 +44,7 @@ func TestCaptureOutputsFullFlow(t *testing.T) {
 	}
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, usage)
+	outputs := captureOutputs(r, usage, "")
 
 	expected := []string{
 		"branch: feature/test-branch",
@@ -69,12 +70,25 @@ func TestCaptureOutputsBaseBranchFromEnv(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "develop")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"branch: my-branch",
 		"commit: deadbeef",
 		"base-branch: develop",
+	}
+	assertOutputLines(t, expected, outputs)
+}
+
+func TestCaptureOutputsResponse(t *testing.T) {
+	r := mockRunner{commands: map[string]mockResult{
+		"git rev-parse --is-inside-work-tree": {err: fmt.Errorf("not a git repo")},
+	}}
+
+	outputs := captureOutputs(r, nil, "Hello\nfrom Cody")
+
+	expected := []string{
+		"response: " + base64.StdEncoding.EncodeToString([]byte("Hello\nfrom Cody")),
 	}
 	assertOutputLines(t, expected, outputs)
 }
@@ -86,7 +100,7 @@ func TestCaptureOutputsNotGitRepo(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	if len(outputs) != 0 {
 		t.Errorf("expected no outputs outside git repo, got %v", outputs)
@@ -106,7 +120,7 @@ func TestCaptureOutputsMultiplePRs(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"branch: feature",
@@ -128,7 +142,7 @@ func TestCaptureOutputsDetachedHead(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"commit: abc123",
@@ -148,7 +162,7 @@ func TestCaptureOutputsGhFails(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"branch: branch",
@@ -170,7 +184,7 @@ func TestCaptureOutputsMarkers(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	if len(outputs) == 0 {
 		t.Fatal("expected non-empty outputs")
@@ -190,22 +204,11 @@ func TestCaptureOutputsNoMarkersWhenEmpty(t *testing.T) {
 
 	t.Setenv("KELOS_BASE_BRANCH", "")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	if len(outputs) != 0 {
 		t.Errorf("expected empty outputs, got %v", outputs)
 	}
-}
-
-func TestCaptureOutputsWithResponse(t *testing.T) {
-	r := mockRunner{commands: map[string]mockResult{
-		"git rev-parse --is-inside-work-tree": {err: fmt.Errorf("not a git repo")},
-	}}
-
-	outputs := captureOutputsWithResponse(r, nil, "Final answer.")
-
-	expected := []string{"response: RmluYWwgYW5zd2VyLg=="}
-	assertOutputLines(t, expected, outputs)
 }
 
 func TestCapturePRsInvalidJSON(t *testing.T) {
@@ -250,7 +253,7 @@ func TestCaptureOutputsWithUpstreamRepo(t *testing.T) {
 	t.Setenv("KELOS_BASE_BRANCH", "")
 	t.Setenv("KELOS_UPSTREAM_REPO", "upstream-org/repo")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"branch: fix-branch",
@@ -279,7 +282,7 @@ func TestCaptureOutputsUpstreamRepoNoPRs(t *testing.T) {
 	t.Setenv("KELOS_BASE_BRANCH", "")
 	t.Setenv("KELOS_UPSTREAM_REPO", "upstream-org/repo")
 
-	outputs := captureOutputs(r, nil)
+	outputs := captureOutputs(r, nil, "")
 
 	expected := []string{
 		"branch: fix-branch",

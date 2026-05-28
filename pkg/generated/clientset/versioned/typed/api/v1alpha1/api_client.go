@@ -29,8 +29,6 @@ import (
 type ApiV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	AgentConfigsGetter
-	AgentSessionsGetter
-	AgentTurnsGetter
 	TasksGetter
 	TaskSpawnersGetter
 	WorkspacesGetter
@@ -43,14 +41,6 @@ type ApiV1alpha1Client struct {
 
 func (c *ApiV1alpha1Client) AgentConfigs(namespace string) AgentConfigInterface {
 	return newAgentConfigs(c, namespace)
-}
-
-func (c *ApiV1alpha1Client) AgentSessions(namespace string) AgentSessionInterface {
-	return newAgentSessions(c, namespace)
-}
-
-func (c *ApiV1alpha1Client) AgentTurns(namespace string) AgentTurnInterface {
-	return newAgentTurns(c, namespace)
 }
 
 func (c *ApiV1alpha1Client) Tasks(namespace string) TaskInterface {

@@ -33,10 +33,6 @@ type When struct {
 	// +optional
 	Cron *Cron `json:"cron,omitempty"`
 
-	// Aikido discovers security issue groups from Aikido on a schedule.
-	// +optional
-	Aikido *Aikido `json:"aikido,omitempty"`
-
 	// Jira discovers issues from a Jira project.
 	// +optional
 	Jira *Jira `json:"jira,omitempty"`
@@ -68,31 +64,6 @@ type Cron struct {
 	// Schedule is a cron expression (e.g., "0 9 * * 1" for every Monday at 9am).
 	// +kubebuilder:validation:Required
 	Schedule string `json:"schedule"`
-}
-
-// Aikido discovers security issue groups from Aikido on a cron schedule.
-type Aikido struct {
-	// Schedule is a cron expression for Aikido discovery.
-	// +kubebuilder:validation:Required
-	Schedule string `json:"schedule"`
-
-	// Repositories filters by exact Aikido code repository name. When empty,
-	// discovery is account-wide for code-repository issue groups.
-	// +optional
-	// +kubebuilder:validation:MaxItems=25
-	Repositories []string `json:"repositories,omitempty"`
-
-	// Statuses filters by Aikido issue group status. Defaults to ["open"].
-	// +optional
-	// +kubebuilder:validation:Items:Enum=open;closed;snoozed;ignored
-	// +kubebuilder:validation:MaxItems=4
-	Statuses []string `json:"statuses,omitempty"`
-
-	// Severities filters by Aikido severity. When empty, all severities match.
-	// +optional
-	// +kubebuilder:validation:Items:Enum=critical;high;medium;low
-	// +kubebuilder:validation:MaxItems=4
-	Severities []string `json:"severities,omitempty"`
 }
 
 // GitHubReporting configures status reporting back to GitHub.
@@ -664,12 +635,6 @@ type Slack struct {
 	// +kubebuilder:validation:items:MinLength=1
 	// +kubebuilder:validation:items:MaxLength=256
 	ExcludePatterns []string `json:"excludePatterns,omitempty"`
-
-	// Session enables thread-scoped session behavior for matching Slack
-	// messages. When unset or disabled, Slack messages keep the existing
-	// one-shot Task behavior.
-	// +optional
-	Session *SlackSession `json:"session,omitempty"`
 }
 
 // SlackTrigger defines a regex pattern trigger for Slack messages.
@@ -685,46 +650,6 @@ type SlackTrigger struct {
 	// without requiring a bot @-mention.
 	// +optional
 	MentionOptional *bool `json:"mentionOptional,omitempty"`
-}
-
-// SlackSessionContextWindow controls which Slack messages are provided to a
-// follow-up turn.
-type SlackSessionContextWindow string
-
-const (
-	// SlackSessionContextWindowSinceLastAgentMessage includes Slack messages
-	// after Cody's last terminal response and through the triggering mention.
-	SlackSessionContextWindowSinceLastAgentMessage SlackSessionContextWindow = "SinceLastAgentMessage"
-)
-
-// SlackSession configures Slack thread-scoped AgentSession behavior.
-type SlackSession struct {
-	// Enabled switches matching Slack messages from one-shot Task creation to
-	// AgentSession/AgentTurn creation.
-	// +optional
-	Enabled bool `json:"enabled,omitempty"`
-
-	// RequireMentionForTurns requires every follow-up turn to explicitly
-	// mention the Slack bot. The first implementation only supports true.
-	// +optional
-	RequireMentionForTurns *bool `json:"requireMentionForTurns,omitempty"`
-
-	// ContextWindow controls which Slack transcript segment is included in
-	// each turn prompt.
-	// +optional
-	// +kubebuilder:validation:Enum=SinceLastAgentMessage
-	ContextWindow SlackSessionContextWindow `json:"contextWindow,omitempty"`
-
-	// IdleTimeout closes an idle session after no queued or running turns
-	// remain for this duration. Defaults to 1h when omitted.
-	// +optional
-	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
-
-	// MaxQueuedTurns limits queued follow-up turns per session. Defaults to 5
-	// when omitted.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxQueuedTurns *int32 `json:"maxQueuedTurns,omitempty"`
 }
 
 // ContextSourceFailurePolicy determines behavior when a context source fails.

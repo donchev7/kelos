@@ -2136,7 +2136,7 @@ func TestSlackTaskReporter_EditsProgressMessageOnTerminalPhase(t *testing.T) {
 	succeededTask := task.DeepCopy()
 	succeededTask.Status.Phase = kelosv1alpha1.TaskPhaseSucceeded
 	succeededTask.Status.Message = "Here is the final answer."
-	succeededTask.Status.Results = map[string]string{"response": "ZG9uZQ=="}
+	succeededTask.Status.Results = map[string]string{"response": "done"}
 
 	cl2 := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(succeededTask).Build()
 	tr.Client = cl2
@@ -2203,7 +2203,7 @@ func TestSlackTaskReporter_FallsBackToPostOnUpdateFailure(t *testing.T) {
 	// Transition to succeeded — update will fail, should fall back to post.
 	succeededTask := task.DeepCopy()
 	succeededTask.Status.Phase = kelosv1alpha1.TaskPhaseSucceeded
-	succeededTask.Status.Results = map[string]string{"response": "ZG9uZQ=="}
+	succeededTask.Status.Results = map[string]string{"response": "done"}
 
 	cl2 := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(succeededTask).Build()
 	tr.Client = cl2

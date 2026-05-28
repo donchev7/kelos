@@ -65,17 +65,6 @@ func formatAttachments(attachments []goslack.Attachment) string {
 // context. The caller decides whether to process the message — this function
 // always returns the thread body when the API call succeeds.
 func FetchThreadContext(ctx context.Context, api *goslack.Client, channelID, threadTS, botUserID string) (string, error) {
-	msgs, err := FetchThreadReplies(ctx, api, channelID, threadTS)
-	if err != nil {
-		return "", err
-	}
-
-	return FormatThreadContext(msgs, botUserID), nil
-}
-
-// FetchThreadReplies fetches the raw Slack thread history for callers that need
-// to inspect individual messages before formatting the agent prompt.
-func FetchThreadReplies(ctx context.Context, api *goslack.Client, channelID, threadTS string) ([]goslack.Message, error) {
 	threadCtx, cancel := context.WithTimeout(ctx, threadFetchTimeout)
 	defer cancel()
 
@@ -85,72 +74,8 @@ func FetchThreadReplies(ctx context.Context, api *goslack.Client, channelID, thr
 			Timestamp: threadTS,
 		})
 	if err != nil {
-		return nil, fmt.Errorf("fetching thread replies: %w", err)
+		return "", fmt.Errorf("fetching thread replies: %w", err)
 	}
 
-	return msgs, nil
-}
-
-// BuildSlackDeltaTranscript formats the Slack messages in the requested
-// timestamp range for a session turn prompt.
-func BuildSlackDeltaTranscript(msgs []goslack.Message, botUserID, botID, fromTSExclusive, toTSInclusive string) (string, int, error) {
-	var b strings.Builder
-	for _, m := range msgs {
-		ts := m.Timestamp
-		if ts == "" {
-			continue
-		}
-		if fromTSExclusive != "" && compareSlackTS(ts, fromTSExclusive) <= 0 {
-			continue
-		}
-		if toTSInclusive != "" && compareSlackTS(ts, toTSInclusive) > 0 {
-			continue
-		}
-		if isCodySlackMessage(m, botUserID, botID) {
-			continue
-		}
-		attachText := formatAttachments(m.Attachments)
-		if strings.TrimSpace(m.Text) == "" && strings.TrimSpace(attachText) == "" {
-			continue
-		}
-		author := m.User
-		if author == "" {
-			author = m.BotID
-		}
-		if author == "" {
-			author = m.Username
-		}
-		if author == "" {
-			author = "unknown"
-		}
-		fmt.Fprintf(&b, "%s [%s]:\n", author, ts)
-		if m.Text != "" {
-			b.WriteString(m.Text)
-			b.WriteString("\n")
-		}
-		if attachText != "" {
-			b.WriteString(attachText)
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
-	out := strings.TrimSpace(b.String())
-	return out, len([]byte(out)), nil
-}
-
-func isCodySlackMessage(m goslack.Message, botUserID, botID string) bool {
-	if botUserID != "" && m.User == botUserID {
-		return true
-	}
-	return botID != "" && m.BotID == botID
-}
-
-func compareSlackTS(a, b string) int {
-	if a == b {
-		return 0
-	}
-	if a < b {
-		return -1
-	}
-	return 1
+	return FormatThreadContext(msgs, botUserID), nil
 }

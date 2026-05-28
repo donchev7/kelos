@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Existing command name for callers that already invoke github-app-token. Token
-# minting is handled by cody-tools; this script does not sign GitHub App JWTs
-# locally.
-set -euo pipefail
-
-exec /usr/local/bin/cody-github-token "$@"

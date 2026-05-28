@@ -129,18 +129,17 @@ func TestRenderPromptAllVariables(t *testing.T) {
 		Comments:       "C",
 		Kind:           "PR",
 		Branch:         "kelos-task-99",
-		Metadata:       map[string]string{"aikido.kelos.dev/severity": "high"},
 		ReviewState:    "changes_requested",
 		ReviewComments: "foo.go:10\nHandle the error",
 	}
 
-	tmpl := "{{.ID}} {{.Number}} {{.Title}} {{.Body}} {{.URL}} {{.Labels}} {{.Comments}} {{.Kind}} {{.Branch}} {{ index .Metadata \"aikido.kelos.dev/severity\" }} {{.ReviewState}} {{.ReviewComments}}"
+	tmpl := "{{.ID}} {{.Number}} {{.Title}} {{.Body}} {{.URL}} {{.Labels}} {{.Comments}} {{.Kind}} {{.Branch}} {{.ReviewState}} {{.ReviewComments}}"
 	result, err := RenderPrompt(tmpl, item)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	expected := "99 99 T B U a, b C PR kelos-task-99 high changes_requested foo.go:10\nHandle the error"
+	expected := "99 99 T B U a, b C PR kelos-task-99 changes_requested foo.go:10\nHandle the error"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
 	}
@@ -169,22 +168,6 @@ func TestRenderTemplate(t *testing.T) {
 	}
 	if result != "kelos-task-42" {
 		t.Errorf("expected %q, got %q", "kelos-task-42", result)
-	}
-}
-
-func TestRenderTemplateMetadata(t *testing.T) {
-	item := WorkItem{
-		Metadata: map[string]string{
-			"aikido.kelos.dev/issue-group-id": "123",
-		},
-	}
-
-	result, err := RenderTemplate(`{{ index .Metadata "aikido.kelos.dev/issue-group-id" }}`, item)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "123" {
-		t.Errorf("expected %q, got %q", "123", result)
 	}
 }
 

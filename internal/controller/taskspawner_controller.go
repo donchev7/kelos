@@ -57,22 +57,6 @@ func isCronBased(ts *kelosv1alpha1.TaskSpawner) bool {
 	return ts.Spec.When.Cron != nil
 }
 
-// isScheduledSource returns true if the TaskSpawner uses a scheduled source.
-func isScheduledSource(ts *kelosv1alpha1.TaskSpawner) bool {
-	return ts.Spec.When.Cron != nil || (ts.Spec.When.Aikido != nil && ts.Spec.When.Aikido.Schedule != "")
-}
-
-func taskSpawnerSchedule(ts *kelosv1alpha1.TaskSpawner) string {
-	switch {
-	case ts.Spec.When.Cron != nil:
-		return ts.Spec.When.Cron.Schedule
-	case ts.Spec.When.Aikido != nil:
-		return ts.Spec.When.Aikido.Schedule
-	default:
-		return ""
-	}
-}
-
 // isWebhookBased returns true if the TaskSpawner is webhook-driven.
 // Slack uses Socket Mode (outbound WebSocket) handled by the centralized
 // kelos-slack-server, so it follows the same no-deployment pattern.
@@ -117,8 +101,8 @@ func (r *TaskSpawnerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	isSuspended := ts.Spec.Suspend != nil && *ts.Spec.Suspend
 
-	// Scheduled TaskSpawners use a CronJob instead of a Deployment.
-	if isScheduledSource(&ts) {
+	// Cron-based TaskSpawners use a CronJob instead of a Deployment.
+	if isCronBased(&ts) {
 		return r.reconcileCronJob(ctx, req, &ts, isSuspended)
 	}
 
@@ -626,9 +610,8 @@ func (r *TaskSpawnerReconciler) createCronJob(ctx context.Context, ts *kelosv1al
 		return ctrl.Result{}, err
 	}
 
-	schedule := taskSpawnerSchedule(ts)
-	logger.Info("Created CronJob", "cronJob", cronJob.Name, "schedule", schedule)
-	r.recordEvent(ts, corev1.EventTypeNormal, "CronJobCreated", "Created spawner CronJob %s with schedule %s", cronJob.Name, schedule)
+	logger.Info("Created CronJob", "cronJob", cronJob.Name, "schedule", ts.Spec.When.Cron.Schedule)
+	r.recordEvent(ts, corev1.EventTypeNormal, "CronJobCreated", "Created spawner CronJob %s with schedule %s", cronJob.Name, ts.Spec.When.Cron.Schedule)
 
 	// Update status
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
